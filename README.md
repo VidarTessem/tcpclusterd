@@ -118,7 +118,7 @@ All configuration is in `.env`. Generate defaults with `./app init`, then custom
 HTTP_ENABLED=true
 
 # HTTP server port
-PORT=8888
+HTTP_PORT=8888
 
 # Listen address (:: = IPv6 any, 0.0.0.0 = IPv4 any)
 HTTP_LISTEN_ADDR=[::]
