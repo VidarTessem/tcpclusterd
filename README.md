@@ -137,6 +137,20 @@ HTTP_WHITELIST_IPS=0.0.0.0/0,::/0
 WS_ENABLED=true
 ```
 
+#### Logging Configuration
+
+```bash
+# Enable/disable file logging (default: false)
+LOG_ENABLED=false
+
+# Log file path (used when LOG_ENABLED=true)
+# If empty, defaults to system.log
+LOG_PATH=system.log
+```
+
+When enabled, logs are written to both stdout and the log file.
+Use this in production if you want persistent server logs on disk.
+
 #### Cluster Peer Configuration
 
 ```bash
