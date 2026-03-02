@@ -104,12 +104,11 @@ func handleWebSocketEvents(conn *websocket.Conn, arrayName string) {
 	// Wait for updates or connection close
 	for {
 		select {
-		case update, ok := <-updateChan:
+		case _, ok := <-updateChan:
 			if !ok {
 				return // Channel closed
 			}
-			conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
-			if err := conn.WriteJSON(update); err != nil {
+			if err := sendWSData(conn, arrayName); err != nil {
 				log.Printf("[WS] Send error: %v\n", err)
 				IncrementErrorCount()
 				return
@@ -187,8 +186,15 @@ func sendWSData(conn *websocket.Conn, arrayName string) error {
 	if arrayName == "" {
 		data = GetAllWithMetrics()
 	} else {
-		data = GetArray(arrayName)
+		data = map[string]interface{}{
+			"arrays": map[string]map[string]string{
+				arrayName: GetArray(arrayName),
+			},
+			"metrics": GetClusterInstance().GetMetrics(),
+		}
 	}
+
+	conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
 
 	return conn.WriteJSON(data)
 }

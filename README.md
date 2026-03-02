@@ -55,7 +55,7 @@ Starting HTTP server on [::]:8888
 
 ```bash
 # Write data
-curl -X POST "http://localhost:8888/cluster/write?array=users&key=user1&value=john_doe"
+curl -X POST "http://localhost:8888/cluster/write?array=users&key=user1&value=john_doe&http_key=YOUR_HTTP_KEY"
 
 # Read data
 curl "http://localhost:8888/cluster/read?array=users&key=user1"
@@ -122,6 +122,9 @@ HTTP_PORT=8888
 
 # Listen address (:: = IPv6 any, 0.0.0.0 = IPv4 any)
 HTTP_LISTEN_ADDR=[::]
+
+# Public write/delete authentication key (required for public mutations)
+HTTP_KEY=change-this-http-write-key
 
 # IP whitelisting - who can access HTTP endpoints
 # Format: comma-separated IPs or CIDR subnets
@@ -226,6 +229,8 @@ TCP_TIMEOUT=30
 
 All HTTP endpoints follow REST conventions. Response format is JSON.
 
+Note: Public write/delete operations require `HTTP_KEY` (query `http_key=` or header `X-HTTP-Key`) when configured.
+
 ### 1. Get All Arrays
 
 **Request:**
@@ -275,7 +280,7 @@ GET /cluster/all?array=users
 
 **Request:**
 ```bash
-POST /cluster/write?array=users&key=user1&value=john_doe
+POST /cluster/write?array=users&key=user1&value=john_doe&http_key=<HTTP_KEY>
 ```
 
 **Response:**
@@ -288,8 +293,8 @@ POST /cluster/write?array=users&key=user1&value=john_doe
 **Multiple writes:**
 ```bash
 # Create multiple users
-curl -X POST "http://localhost:8888/cluster/write?array=users&key=alice&value=alice_wonder"
-curl -X POST "http://localhost:8888/cluster/write?array=users&key=bob&value=bob_builder"
+curl -X POST "http://localhost:8888/cluster/write?array=users&key=alice&value=alice_wonder&http_key=<HTTP_KEY>"
+curl -X POST "http://localhost:8888/cluster/write?array=users&key=bob&value=bob_builder&http_key=<HTTP_KEY>"
 ```
 
 ### 4. Read Single Key
@@ -315,12 +320,12 @@ GET /cluster/read?array=users&key=user1
 
 **Request (delete specific key):**
 ```bash
-DELETE /cluster/delete?array=users&key=user1
+DELETE /cluster/delete?array=users&key=user1&http_key=<HTTP_KEY>
 ```
 
 **Request (delete entire array):**
 ```bash
-DELETE /cluster/delete?array=users
+DELETE /cluster/delete?array=users&http_key=<HTTP_KEY>
 ```
 
 **Response:**

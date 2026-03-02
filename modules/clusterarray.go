@@ -28,39 +28,41 @@ type WebSocketUpdate struct {
 
 // Cluster represents a distributed cluster array instance
 type Cluster struct {
-	data             map[string]map[string]string
-	privateData      map[string]map[string]string // Private arrays requiring authentication
-	timestamps       map[string]time.Time
-	mu               sync.RWMutex
-	port             string
-	listenAddr       string
-	peers            []string
-	lastSyncTime     time.Time
-	syncCount        int64
-	failedSyncs      int64
-	totalSyncBytes   int64
-	errorCount       int64 // Total error count across all operations
-	runtimePath      string
-	broadcastChan    chan bool
-	aesKey           []byte
-	peerSecret       string
-	httpWhitelist    []string // IP addresses allowed to access HTTP
-	clusterWhitelist []string // IP addresses allowed to access peer sync port
-	tcpWhitelist     []string // IP addresses allowed to access TCP port
-	persistenceChan  chan persistenceTask
-	tcpPort          string
-	tcpListenAddr    string
-	tcpKey           string
-	TcpEnabled       bool
-	WsEnabled        bool
-	HttpEnabled      bool
-	bootupTime       time.Time                         // Time when this cluster node started
-	peerBootupTimes  map[string]time.Time              // Bootup times of peer nodes
-	wsSubscriptions  map[string][]chan WebSocketUpdate // Array name -> list of subscriber channels
-	wsSubMu          sync.RWMutex                      // Lock for wsSubscriptions
-	adminUsername    string                            // Admin username for authentication
-	adminPassword    string                            // Admin password for authentication
-	tcpTimeout       time.Duration                     // TCP connection timeout
+	data               map[string]map[string]string
+	privateData        map[string]map[string]string // Private arrays requiring authentication
+	timestamps         map[string]time.Time
+	mu                 sync.RWMutex
+	port               string
+	listenAddr         string
+	peers              []string
+	lastSyncTime       time.Time
+	syncCount          int64
+	failedSyncs        int64
+	totalSyncBytes     int64
+	errorCount         int64 // Total error count across all operations
+	runtimePath        string
+	broadcastChan      chan bool
+	aesKey             []byte
+	peerSecret         string
+	httpWhitelistRead  []string // IP addresses allowed to read from HTTP
+	httpWhitelistWrite []string // IP addresses allowed to write to HTTP
+	clusterWhitelist   []string // IP addresses allowed to access peer sync port
+	tcpWhitelist       []string // IP addresses allowed to access TCP port
+	persistenceChan    chan persistenceTask
+	tcpPort            string
+	tcpListenAddr      string
+	tcpKey             string
+	TcpEnabled         bool
+	WsEnabled          bool
+	HttpEnabled        bool
+	ClusterHideIP      bool                              // Hide actual peer IPs in responses, use node$i instead
+	bootupTime         time.Time                         // Time when this cluster node started
+	peerBootupTimes    map[string]time.Time              // Bootup times of peer nodes
+	wsSubscriptions    map[string][]chan WebSocketUpdate // Array name -> list of subscriber channels
+	wsSubMu            sync.RWMutex                      // Lock for wsSubscriptions
+	adminUsername      string                            // Admin username for authentication
+	adminPassword      string                            // Admin password for authentication
+	tcpTimeout         time.Duration                     // TCP connection timeout
 }
 
 type persistenceTask struct {
@@ -117,7 +119,8 @@ func InitClusterArray(env map[string]string, loadLastConfig bool) {
 
 	// Reset slice-based configuration to avoid duplicates when re-initialized.
 	clusterArray.peers = clusterArray.peers[:0]
-	clusterArray.httpWhitelist = clusterArray.httpWhitelist[:0]
+	clusterArray.httpWhitelistRead = clusterArray.httpWhitelistRead[:0]
+	clusterArray.httpWhitelistWrite = clusterArray.httpWhitelistWrite[:0]
 	clusterArray.clusterWhitelist = clusterArray.clusterWhitelist[:0]
 
 	if peersStr, ok := env["CLUSTER_PEERS"]; ok {
@@ -125,6 +128,8 @@ func InitClusterArray(env map[string]string, loadLastConfig bool) {
 		for _, peer := range peers {
 			peer = strings.TrimSpace(peer)
 			if peer != "" {
+				// Normalize IPv6 addresses by stripping brackets for consistent key format
+				peer = strings.TrimPrefix(strings.TrimSuffix(peer, "]"), "[")
 				clusterArray.peers = append(clusterArray.peers, peer)
 			}
 		}
@@ -164,12 +169,22 @@ func InitClusterArray(env map[string]string, loadLastConfig bool) {
 		clusterArray.peerSecret = peerSecret
 	}
 
-	// Parse HTTP whitelist IPs
-	if httpWhitelist, ok := env["HTTP_WHITELIST_IPS"]; ok && httpWhitelist != "" {
+	// Parse HTTP read whitelist IPs
+	if httpWhitelist, ok := env["HTTP_WHITELIST_READ"]; ok && httpWhitelist != "" {
 		for _, ip := range strings.Split(httpWhitelist, ",") {
 			ip = strings.TrimSpace(ip)
 			if ip != "" {
-				clusterArray.httpWhitelist = append(clusterArray.httpWhitelist, ip)
+				clusterArray.httpWhitelistRead = append(clusterArray.httpWhitelistRead, ip)
+			}
+		}
+	}
+
+	// Parse HTTP write whitelist IPs
+	if httpWhitelist, ok := env["HTTP_WHITELIST_WRITE"]; ok && httpWhitelist != "" {
+		for _, ip := range strings.Split(httpWhitelist, ",") {
+			ip = strings.TrimSpace(ip)
+			if ip != "" {
+				clusterArray.httpWhitelistWrite = append(clusterArray.httpWhitelistWrite, ip)
 			}
 		}
 	}
@@ -247,6 +262,11 @@ func InitClusterArray(env map[string]string, loadLastConfig bool) {
 	clusterArray.HttpEnabled = true
 	if httpEnabled, ok := env["HTTP_ENABLED"]; ok && (httpEnabled == "false" || httpEnabled == "0") {
 		clusterArray.HttpEnabled = false
+	}
+
+	// Parse cluster hide IP configuration
+	if hideIP, ok := env["CLUSTER_HIDE_IP"]; ok && (hideIP == "true" || hideIP == "1") {
+		clusterArray.ClusterHideIP = true
 	}
 
 	// Start TCP server if configured and enabled
@@ -950,8 +970,22 @@ func (c *Cluster) GetMetrics() map[string]interface{} {
 
 	// Convert peer bootup times to a readable format
 	peerBootups := make(map[string]string)
-	for peer, bootTime := range c.peerBootupTimes {
-		peerBootups[peer] = bootTime.Format(time.RFC3339)
+	displayPeers := make([]string, len(c.peers))
+
+	for i, peer := range c.peers {
+		if c.ClusterHideIP {
+			nodeName := fmt.Sprintf("node%d", i)
+			displayPeers[i] = nodeName
+			// Map hidden node names to bootup times
+			if bootTime, ok := c.peerBootupTimes[peer]; ok {
+				peerBootups[nodeName] = bootTime.Format(time.RFC3339)
+			}
+		} else {
+			displayPeers[i] = peer
+			if bootTime, ok := c.peerBootupTimes[peer]; ok {
+				peerBootups[peer] = bootTime.Format(time.RFC3339)
+			}
+		}
 	}
 
 	// Determine cluster health status
@@ -979,7 +1013,7 @@ func (c *Cluster) GetMetrics() map[string]interface{} {
 		"total_sync_bytes":  c.totalSyncBytes,
 		"error_count":       c.errorCount,
 		"peer_count":        len(c.peers),
-		"peers":             c.peers,
+		"peers":             displayPeers,
 		"peer_bootup_times": peerBootups,
 		"health":            health,
 	}
@@ -1147,7 +1181,7 @@ func (c *Cluster) syncFromPeersOnStartup() {
 					time.Sleep(delay)
 				}
 
-				conn, err := net.DialTimeout("tcp", peerAddr+":9000", 5*time.Second)
+				conn, err := net.DialTimeout("tcp", formatPeerAddr(peerAddr)+":9000", 5*time.Second)
 				if err != nil {
 					if attempt == maxRetries-1 {
 						log.Printf("[CLUSTER] Failed to sync from peer %s after %d attempts: %v\n", peerAddr, maxRetries, err)
@@ -1220,6 +1254,15 @@ func (c *Cluster) syncFromPeersOnStartup() {
 	go c.periodicPeerSync()
 }
 
+// formatPeerAddr wraps IPv6 addresses in brackets for net.Dial
+func formatPeerAddr(addr string) string {
+	// If address contains colons (IPv6) and not already bracketed, add brackets
+	if strings.Contains(addr, ":") && !strings.HasPrefix(addr, "[") {
+		return "[" + addr + "]"
+	}
+	return addr
+}
+
 // periodicPeerSync runs a background task to periodically sync with peers
 func (c *Cluster) periodicPeerSync() {
 	ticker := time.NewTicker(30 * time.Second)
@@ -1228,7 +1271,7 @@ func (c *Cluster) periodicPeerSync() {
 	for range ticker.C {
 		for _, peer := range clusterArray.peers {
 			go func(peerAddr string) {
-				conn, err := net.DialTimeout("tcp", peerAddr+":9000", 5*time.Second)
+				conn, err := net.DialTimeout("tcp", formatPeerAddr(peerAddr)+":9000", 5*time.Second)
 				if err != nil {
 					// Silently fail, we'll retry next time
 					return
@@ -1371,6 +1414,18 @@ func (c *Cluster) handlePeerConnection(conn net.Conn) {
 			return
 		}
 
+		// Store peer's bootup time from incoming connection
+		remoteAddr := conn.RemoteAddr().String()
+		if host, _, err := net.SplitHostPort(remoteAddr); err == nil {
+			remoteAddr = host
+		}
+		// Strip brackets from IPv6 addresses for consistent key format
+		remoteAddr = strings.TrimPrefix(strings.TrimSuffix(remoteAddr, "]"), "[")
+
+		c.mu.Lock()
+		c.peerBootupTimes[remoteAddr] = c.bootupTime
+		c.mu.Unlock()
+
 		fmt.Fprintf(writer, "%s\n", encrypted)
 		writer.Flush()
 		log.Printf("[CLUSTER] Sent encrypted arrays to peer\n")
@@ -1404,6 +1459,8 @@ func (c *Cluster) handlePeerConnection(conn net.Conn) {
 			if host, _, err := net.SplitHostPort(remoteAddr); err == nil {
 				remoteAddr = host
 			}
+			// Strip brackets from IPv6 addresses for consistent key format
+			remoteAddr = strings.TrimPrefix(strings.TrimSuffix(remoteAddr, "]"), "[")
 			c.peerBootupTimes[remoteAddr] = payload.BootupTime
 			c.mu.Unlock()
 		}
@@ -1448,7 +1505,7 @@ func (c *Cluster) broadcastWorker() {
 
 		for _, peer := range c.peers {
 			go func(peerAddr string) {
-				conn, err := net.DialTimeout("tcp", peerAddr+":9000", 5*time.Second)
+				conn, err := net.DialTimeout("tcp", formatPeerAddr(peerAddr)+":9000", 5*time.Second)
 				if err != nil {
 					c.mu.Lock()
 					c.failedSyncs++

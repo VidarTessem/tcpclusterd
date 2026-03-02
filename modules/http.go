@@ -63,12 +63,14 @@ func InitializeEnv(path string) error {
 	cipherKey := GenerateRandomKey(32)  // 32 bytes for AES-256
 	peerSecret := GenerateRandomKey(16) // 16 bytes for peer secret
 	tcpKey := GenerateRandomKey(16)     // 16 bytes for TCP auth
+	httpKey := GenerateRandomKey(16)    // 16 bytes for HTTP write auth
 
 	defaultEnv := fmt.Sprintf(`# HTTP server configuration
 HTTP_ENABLED=true
 HTTP_PORT=8888
 HTTP_LISTEN_ADDR=[::]
 HTTP_WHITELIST_IPS=0.0.0.0/0,::/0
+HTTP_KEY=%s
 
 	# HTTPS server configuration
 	HTTPS_ENABLED=false
@@ -107,7 +109,7 @@ TCP_TIMEOUT=30
 # Authentication for private arrays
 ADMIN_USERNAME=admin
 ADMIN_PASSWORD=changeme
-`, cipherKey, peerSecret, tcpKey)
+`, httpKey, cipherKey, peerSecret, tcpKey)
 
 	if err := os.WriteFile(path, []byte(defaultEnv), 0600); err != nil {
 		return fmt.Errorf("failed to create .env file: %w", err)
@@ -127,12 +129,14 @@ func EnsureEnvFile(path string) error {
 	cipherKey := GenerateRandomKey(32)  // 32 bytes for AES-256
 	peerSecret := GenerateRandomKey(16) // 16 bytes for peer secret
 	tcpKey := GenerateRandomKey(16)     // 16 bytes for TCP auth
+	httpKey := GenerateRandomKey(16)    // 16 bytes for HTTP write auth
 
 	defaultEnv := fmt.Sprintf(`HTTP_PORT=8888
 
 	# HTTP and HTTPS server configuration
 	HTTP_ENABLED=true
 	HTTP_LISTEN_ADDR=0.0.0.0
+	HTTP_KEY=%s
 
 	HTTPS_ENABLED=false
 	HTTPS_PORT=8443
@@ -167,7 +171,7 @@ TCP_PORT=9001
 TCP_LISTEN_ADDR=0.0.0.0
 TCP_KEY=%s
 TCP_TIMEOUT=30
-`, cipherKey, peerSecret, tcpKey)
+`, httpKey, cipherKey, peerSecret, tcpKey)
 
 	if err := os.WriteFile(path, []byte(defaultEnv), 0600); err != nil {
 		return fmt.Errorf("failed to create .env file: %w", err)
@@ -292,12 +296,17 @@ func StartHTTPServer(loadLastConfig bool) error {
 	// Get admin credentials from .env
 	adminUsername := env["ADMIN_USERNAME"]
 	adminPassword := env["ADMIN_PASSWORD"]
+	publicHTTPKey := strings.TrimSpace(env["HTTP_KEY"])
+	requirePublicHTTPKey := publicHTTPKey != ""
 	if adminUsername == "" {
 		adminUsername = "admin"
 	}
 	if adminPassword == "" {
 		adminPassword = "changeme"
 		log.Printf("[HTTP] Warning: Using default admin password. Please set ADMIN_PASSWORD in .env")
+	}
+	if requirePublicHTTPKey {
+		log.Printf("[HTTP] Public write/delete endpoints require HTTP_KEY authentication")
 	}
 
 	// Create runtime directory for HTTP server
@@ -375,8 +384,37 @@ func StartHTTPServer(loadLastConfig bool) error {
 		return username == adminUsername && password == adminPassword
 	}
 
-	// IP whitelist check middleware wrapper
-	ipCheckMiddleware := func(handler http.HandlerFunc) http.HandlerFunc {
+	// Public write auth helper.
+	// Priority:
+	// 1) Query param: http_key
+	// 2) Header: X-HTTP-Key
+	// 3) Query param: key (only when data_key is provided)
+	checkPublicWriteAuth := func(r *http.Request) bool {
+		if !requirePublicHTTPKey {
+			return true
+		}
+
+		provided := strings.TrimSpace(r.URL.Query().Get("http_key"))
+		if provided == "" {
+			provided = strings.TrimSpace(r.Header.Get("X-HTTP-Key"))
+		}
+		if provided == "" && strings.TrimSpace(r.URL.Query().Get("data_key")) != "" {
+			provided = strings.TrimSpace(r.URL.Query().Get("key"))
+		}
+
+		return provided == publicHTTPKey
+	}
+
+	// Public data-key helper (backward compatible)
+	getPublicDataKey := func(r *http.Request) string {
+		if dk := strings.TrimSpace(r.URL.Query().Get("data_key")); dk != "" {
+			return dk
+		}
+		return strings.TrimSpace(r.URL.Query().Get("key"))
+	}
+
+	// IP whitelist check middleware wrapper for read operations
+	ipCheckReadMiddleware := func(handler http.HandlerFunc) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
 			if enforceHostHeader {
 				host := extractHostFromRequestHost(r.Host)
@@ -387,9 +425,30 @@ func StartHTTPServer(loadLastConfig bool) error {
 				}
 			}
 
-			if !GetClusterInstance().isIPAllowed(r.RemoteAddr, GetClusterInstance().httpWhitelist) {
+			if !GetClusterInstance().isIPAllowed(r.RemoteAddr, GetClusterInstance().httpWhitelistRead) {
 				http.Error(w, "Access denied: IP not whitelisted", http.StatusForbidden)
-				log.Printf("[HTTP] Rejected request from %s: IP not whitelisted", r.RemoteAddr)
+				log.Printf("[HTTP] Rejected request from %s: IP not whitelisted for read", r.RemoteAddr)
+				return
+			}
+			handler(w, r)
+		}
+	}
+
+	// IP whitelist check middleware wrapper for write operations
+	ipCheckWriteMiddleware := func(handler http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			if enforceHostHeader {
+				host := extractHostFromRequestHost(r.Host)
+				if _, ok := allowedDomainSet[host]; !ok {
+					http.Error(w, "Host not allowed", http.StatusForbidden)
+					log.Printf("[HTTP] Rejected request for disallowed host: %s (remote: %s)", r.Host, r.RemoteAddr)
+					return
+				}
+			}
+
+			if !GetClusterInstance().isIPAllowed(r.RemoteAddr, GetClusterInstance().httpWhitelistWrite) {
+				http.Error(w, "Access denied: IP not whitelisted", http.StatusForbidden)
+				log.Printf("[HTTP] Rejected request from %s: IP not whitelisted for write", r.RemoteAddr)
 				return
 			}
 			handler(w, r)
@@ -419,23 +478,28 @@ func StartHTTPServer(loadLastConfig bool) error {
 		json.NewEncoder(w).Encode(GetArray(arrayName))
 	}
 
-	mux.HandleFunc("/", ipCheckMiddleware(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/", ipCheckReadMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		writeArraysResponse(w, r)
 	}))
 
 	// Test endpoint: POST /cluster/write?array=<name>&key=<key>&value=<value>
-	mux.HandleFunc("/cluster/write", ipCheckMiddleware(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/cluster/write", ipCheckWriteMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
+		if !checkPublicWriteAuth(r) {
+			http.Error(w, "Invalid or missing HTTP_KEY", http.StatusUnauthorized)
+			return
+		}
+
 		arrayName := r.URL.Query().Get("array")
-		key := r.URL.Query().Get("key")
+		key := getPublicDataKey(r)
 		value := r.URL.Query().Get("value")
 
 		if arrayName == "" || key == "" || value == "" {
-			http.Error(w, "Missing array, key or value parameter", http.StatusBadRequest)
+			http.Error(w, "Missing array, key/data_key or value parameter", http.StatusBadRequest)
 			return
 		}
 
@@ -449,7 +513,7 @@ func StartHTTPServer(loadLastConfig bool) error {
 	}))
 
 	// Test endpoint: GET /cluster/read?array=<name>&key=<key>
-	mux.HandleFunc("/cluster/read", ipCheckMiddleware(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/cluster/read", ipCheckReadMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		arrayName := r.URL.Query().Get("array")
 		key := r.URL.Query().Get("key")
 
@@ -469,13 +533,13 @@ func StartHTTPServer(loadLastConfig bool) error {
 	}))
 
 	// Test endpoint: GET /cluster/all - returns all arrays with metrics
-	mux.HandleFunc("/cluster/all", ipCheckMiddleware(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/cluster/all", ipCheckReadMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		writeArraysResponse(w, r)
 	}))
 
 	// Private array endpoints (require authentication)
 	// POST /cluster/private/write?array=<name>&key=<key>&value=<value>
-	mux.HandleFunc("/cluster/private/write", ipCheckMiddleware(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/cluster/private/write", ipCheckWriteMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -506,7 +570,7 @@ func StartHTTPServer(loadLastConfig bool) error {
 	}))
 
 	// GET /cluster/private/read?array=<name>&key=<key>
-	mux.HandleFunc("/cluster/private/read", ipCheckMiddleware(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/cluster/private/read", ipCheckReadMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		if !checkAuth(r) {
 			w.Header().Set("WWW-Authenticate", `Basic realm="Private Array Access"`)
 			http.Error(w, "Authentication required", http.StatusUnauthorized)
@@ -532,7 +596,7 @@ func StartHTTPServer(loadLastConfig bool) error {
 	}))
 
 	// DELETE /cluster/private/delete?array=<name>&key=<key>
-	mux.HandleFunc("/cluster/private/delete", ipCheckMiddleware(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/cluster/private/delete", ipCheckWriteMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodDelete && r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -572,18 +636,23 @@ func StartHTTPServer(loadLastConfig bool) error {
 
 	// WebSocket endpoint for real-time array updates
 	if GetClusterInstance().WsEnabled {
-		mux.HandleFunc("/ws", HandleWebSocket)
+		mux.HandleFunc("/ws", ipCheckReadMiddleware(HandleWebSocket))
 	}
 
 	// DELETE endpoint: DELETE /cluster/delete?array=<name>&key=<key>
-	mux.HandleFunc("/cluster/delete", ipCheckMiddleware(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/cluster/delete", ipCheckWriteMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodDelete && r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
+		if !checkPublicWriteAuth(r) {
+			http.Error(w, "Invalid or missing HTTP_KEY", http.StatusUnauthorized)
+			return
+		}
+
 		arrayName := r.URL.Query().Get("array")
-		key := r.URL.Query().Get("key")
+		key := getPublicDataKey(r)
 
 		if arrayName == "" {
 			http.Error(w, "Missing array parameter", http.StatusBadRequest)
