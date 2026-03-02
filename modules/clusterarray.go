@@ -1386,7 +1386,12 @@ func (c *Cluster) handlePeerConnection(conn net.Conn) {
 		// Store peer's bootup time
 		if !payload.BootupTime.IsZero() {
 			c.mu.Lock()
-			c.peerBootupTimes[conn.RemoteAddr().String()] = payload.BootupTime
+			// Extract host/IP from remote address to normalize peer identification (remove ephemeral port)
+			remoteAddr := conn.RemoteAddr().String()
+			if host, _, err := net.SplitHostPort(remoteAddr); err == nil {
+				remoteAddr = host
+			}
+			c.peerBootupTimes[remoteAddr] = payload.BootupTime
 			c.mu.Unlock()
 		}
 
