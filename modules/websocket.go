@@ -62,8 +62,8 @@ func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 // handleWebSocketEvents uses event-based push (subscribes to updates)
 func handleWebSocketEvents(conn *websocket.Conn, arrayName string) {
 	// Subscribe to array updates
-	updateChan := GetClusterInstance().SubscribeToArray(arrayName)
-	defer GetClusterInstance().UnsubscribeFromArray(arrayName, updateChan)
+	updateChan, unsubscribe := GetClusterInstance().SubscribeToArray(arrayName)
+	defer unsubscribe()
 
 	// Send initial data
 	sendWSData(conn, arrayName)

@@ -293,9 +293,105 @@ DELETE /cluster/delete?array=users
 
 ---
 
+## Private Arrays
+
+Private arrays require authentication and are only accessible with valid credentials. Perfect for storing sensitive data like API keys, tokens, or user credentials.
+
+### Authentication
+
+Use HTTP Basic Auth with credentials from `.env`:
+
+```bash
+# From .env file
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD=passord
+```
+
+### Private Array Endpoints
+
+All endpoints mirror the public API but are prefixed with `/cluster/private/`:
+
+#### 1. Get All Private Arrays
+
+**Request:**
+```bash
+GET /cluster/private/all -u admin:passord
+```
+
+**Response:**
+```json
+{
+  "arrays": {
+    "secrets": {
+      "api_key": "sk-abc123xyz789",
+      "db_password": "super_secret_123"
+    }
+  },
+  "private_arrays": {
+    "tokens": {
+      "refresh_token": "eyJhbGc...",
+      "access_token": "eyJhbGc..."
+    }
+  },
+  "metrics": {...}
+}
+```
+
+#### 2. Write to Private Array
+
+**Request:**
+```bash
+POST /cluster/private/write?array=secrets&key=api_key&value=sk-abc123xyz789 \
+  -u admin:passord
+```
+
+#### 3. Read from Private Array
+
+**Request:**
+```bash
+GET /cluster/private/read?array=secrets&key=api_key \
+  -u admin:passord
+```
+
+#### 4. Delete from Private Array
+
+**Request:**
+```bash
+DELETE /cluster/private/delete?array=secrets&key=api_key \
+  -u admin:passord
+```
+
+### TCP Protocol with Private Arrays
+
+TCP supports private array access with three authentication levels:
+
+```bash
+# Level 1: No auth (public arrays only)
+TCP_LEVEL=0
+
+# Level 2: TCP key only (public arrays only)  
+TCP_LEVEL=1  
+TCP_KEY=SPq0ux9P9i7pxaaq60rcgA==
+
+# Level 3: TCP key + admin credentials (public + private)
+TCP_LEVEL=2
+TCP_KEY=SPq0ux9P9i7pxaaq60rcgA==
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD=passord
+```
+
+**Example - Access private data via TCP:**
+```bash
+# Send TCP_KEY (auth level 2 to also include ADMIN auth)
+# Then send special command: PRIVATE:GET_ARRAYS
+echo -e "SPq0ux9P9i7pxaaq60rcgA==\nPRIVATE:GET_ARRAYS" | nc localhost 9001
+```
+
+---
+
 ## WebSocket Protocol
 
-Real-time streaming of array updates. Clients connect and receive JSON updates at specified intervals.
+Real-time streaming of array updates with **event-based push** (no polling by default).
 
 ### Connection
 
@@ -306,48 +402,48 @@ ws://localhost:8888/ws?array=users&interval=1000
 
 **Query Parameters:**
 - `array` - (optional) Watch specific array only (omit to watch all)
-- `interval` - (optional) Update frequency in milliseconds (default: 1000)
+- `interval` - (optional) Enable polling mode with update frequency in milliseconds (if omitted, uses instant event-based push)
 
-### Examples
+### Update Format
 
-#### Watch All Arrays
-
-```bash
-wscat -c "ws://localhost:8888/ws"
-```
-
-Client receives updates every 1 second (default):
+When data changes, you receive:
 ```json
 {
-  "arrays": {
-    "users": {
-      "user1": "john_doe",
-      "user2": "jane_smith"
-    }
+  "array_name": "users",
+  "data": {
+    "user1": "john_doe",
+    "user2": "jane_smith"
   },
-  "metrics": {...}
+  "timestamp": "2026-03-01T21:02:17.123456Z"
 }
 ```
 
-#### Watch Specific Array
+### Connection Modes
+
+#### Event-Based Mode (Default - **Recommended**)
+
+Updates are pushed **immediately** when data changes:
 
 ```bash
 wscat -c "ws://localhost:8888/ws?array=users"
 ```
 
-Client receives:
-```json
-{
-  "users": {
-    "user1": "john_doe",
-    "user2": "jane_smith"
-  }
-}
+When you write to the array:
+```bash
+POST /cluster/write?array=users&key=alice&value=alice_wonder
 ```
 
-#### Custom Update Interval
+All connected WebSocket clients receive the update instantly.
+
+#### Polling Mode (Legacy)
+
+Use `interval` parameter to poll at regular intervals:
 
 ```bash
+wscat -c "ws://localhost:8888/ws?array=users&interval=1000"
+```
+
+Client receives updates every 1 second (regardless of whether data changed).
 # Update every 5 seconds
 wscat -c "ws://localhost:8888/ws?array=users&interval=5000"
 

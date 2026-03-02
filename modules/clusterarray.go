@@ -1630,7 +1630,8 @@ func (c *Cluster) convertInterfaceToStringMap(data map[string]interface{}) map[s
 }
 
 // SubscribeToArray subscribes a channel to receive updates for a specific array
-func (c *Cluster) SubscribeToArray(arrayName string) <-chan WebSocketUpdate {
+// Returns the update channel and an unsubscribe function
+func (c *Cluster) SubscribeToArray(arrayName string) (<-chan WebSocketUpdate, func()) {
 	c.wsSubMu.Lock()
 	defer c.wsSubMu.Unlock()
 
@@ -1643,10 +1644,33 @@ func (c *Cluster) SubscribeToArray(arrayName string) <-chan WebSocketUpdate {
 	}
 	c.wsSubscriptions[arrayName] = append(c.wsSubscriptions[arrayName], updateChan)
 
-	return updateChan
+	// Return the read-only channel and an unsubscribe function
+	unsubscribeFn := func() {
+		c.wsSubMu.Lock()
+		defer c.wsSubMu.Unlock()
+
+		if subscribers, ok := c.wsSubscriptions[arrayName]; ok {
+			// Find and remove the channel
+			for i, ch := range subscribers {
+				if ch == updateChan {
+					// Remove from slice
+					c.wsSubscriptions[arrayName] = append(subscribers[:i], subscribers[i+1:]...)
+					close(ch)
+					break
+				}
+			}
+
+			// Clean up empty arrays
+			if len(c.wsSubscriptions[arrayName]) == 0 {
+				delete(c.wsSubscriptions, arrayName)
+			}
+		}
+	}
+
+	return updateChan, unsubscribeFn
 }
 
-// UnsubscribeFromArray removes a subscriber channel from the list
+// UnsubscribeFromArray is deprecated - use the unsubscribe function returned by SubscribeToArray instead
 func (c *Cluster) UnsubscribeFromArray(arrayName string, updateChan chan WebSocketUpdate) {
 	c.wsSubMu.Lock()
 	defer c.wsSubMu.Unlock()
