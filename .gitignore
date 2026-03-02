@@ -31,11 +31,10 @@ TEST_IP_WHITELIST.sh
 .DS_Store
 Thumbs.db
 
-# Debug documentation (generated during development)
+# Development/Internal documentation (not for public)
 EXPORT_IMPORT_FIX.md
 EXPORT_IMPORT_FORMAT.md
 IMPLEMENTATION_SUMMARY.md
 IP_WHITELIST.md
 LIBRARY.md
 REFACTORING.md
-SECURITY.md
