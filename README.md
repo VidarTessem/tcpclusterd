@@ -1167,3 +1167,4 @@ HTTP: Access denied: IP not whitelisted
 9. **Use --lastconfig on reboot** - Recover last state
 10. **Test failover** - Stop nodes to verify redundancy
 
+# tcpclusterd
