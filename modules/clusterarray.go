@@ -13,6 +13,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -58,6 +59,7 @@ type Cluster struct {
 	wsSubMu          sync.RWMutex                      // Lock for wsSubscriptions
 	adminUsername    string                            // Admin username for authentication
 	adminPassword    string                            // Admin password for authentication
+	tcpTimeout       time.Duration                     // TCP connection timeout
 }
 
 type persistenceTask struct {
@@ -82,6 +84,7 @@ func init() {
 		bootupTime:      time.Now(),
 		peerBootupTimes: make(map[string]time.Time),
 		wsSubscriptions: make(map[string][]chan WebSocketUpdate),
+		tcpTimeout:      30 * time.Second, // Default 30 second timeout
 	}
 
 	// Start background broadcast worker
@@ -214,6 +217,14 @@ func InitClusterArray(env map[string]string, loadLastConfig bool) {
 		clusterArray.adminPassword = adminPassword
 	} else {
 		clusterArray.adminPassword = "changeme"
+	}
+
+	// Load TCP timeout configuration (default: 30 seconds)
+	clusterArray.tcpTimeout = 30 * time.Second
+	if tcpTimeoutStr, ok := env["TCP_TIMEOUT"]; ok && tcpTimeoutStr != "" {
+		if seconds, err := strconv.ParseInt(tcpTimeoutStr, 10, 64); err == nil && seconds > 0 {
+			clusterArray.tcpTimeout = time.Duration(seconds) * time.Second
+		}
 	}
 
 	// Parse WebSocket configuration

@@ -45,7 +45,7 @@ func (c *Cluster) handleTCPConnection(conn net.Conn, key string) {
 		return
 	}
 
-	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+	conn.SetReadDeadline(time.Now().Add(c.tcpTimeout))
 
 	reader := bufio.NewReader(conn)
 	writer := bufio.NewWriter(conn)
@@ -102,7 +102,7 @@ func (c *Cluster) handleTCPConnection(conn net.Conn, key string) {
 
 	// Handle commands
 	for {
-		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		conn.SetReadDeadline(time.Now().Add(c.tcpTimeout))
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			return

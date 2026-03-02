@@ -179,6 +179,10 @@ TCP_KEY=1MHgSdYRzoaMTOW1N3HlXg==
 
 # IP whitelisting for TCP connections
 TCP_WHITELIST_IPS=0.0.0.0/0,::/0
+
+# TCP connection inactivity timeout in seconds (default: 30)
+# The server will close TCP connections idle for longer than this period
+TCP_TIMEOUT=30
 ```
 
 ---
