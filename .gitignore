@@ -1,0 +1,41 @@
+# Environment variables (local only)
+.env
+
+# Shell scripts (local testing only)
+*.sh
+
+# Binary output
+app
+
+# Runtime directories (generated)
+runtime/
+
+# Test files
+test.sh
+TEST_IP_WHITELIST.sh
+
+# Build artifacts
+*.o
+*.a
+*.so
+*.dylib
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Debug documentation (generated during development)
+EXPORT_IMPORT_FIX.md
+EXPORT_IMPORT_FORMAT.md
+IMPLEMENTATION_SUMMARY.md
+IP_WHITELIST.md
+LIBRARY.md
+REFACTORING.md
+SECURITY.md
