@@ -19,6 +19,12 @@ import (
 	"time"
 )
 
+const (
+	peerHeartbeatInterval = 1 * time.Second
+	peerAliveTTL          = 3 * time.Second
+	peerHeartbeatTimeout  = 1200 * time.Millisecond
+)
+
 // WebSocketUpdate represents an update pushed to WebSocket clients
 type WebSocketUpdate struct {
 	ArrayName string            `json:"array_name"`
@@ -58,11 +64,13 @@ type Cluster struct {
 	ClusterHideIP      bool                              // Hide actual peer IPs in responses, use node$i instead
 	bootupTime         time.Time                         // Time when this cluster node started
 	peerBootupTimes    map[string]time.Time              // Bootup times of peer nodes
+	peerLastSeen       map[string]time.Time              // Last successful contact time per peer
 	wsSubscriptions    map[string][]chan WebSocketUpdate // Array name -> list of subscriber channels
 	wsSubMu            sync.RWMutex                      // Lock for wsSubscriptions
 	adminUsername      string                            // Admin username for authentication
 	adminPassword      string                            // Admin password for authentication
 	tcpTimeout         time.Duration                     // TCP connection timeout
+	nodeID             string                            // Cached node identifier for logging
 }
 
 type persistenceTask struct {
@@ -86,6 +94,7 @@ func init() {
 		persistenceChan: make(chan persistenceTask, 2048),
 		bootupTime:      time.Now(),
 		peerBootupTimes: make(map[string]time.Time),
+		peerLastSeen:    make(map[string]time.Time),
 		wsSubscriptions: make(map[string][]chan WebSocketUpdate),
 		tcpTimeout:      30 * time.Second, // Default 30 second timeout
 		TcpEnabled:      true,
@@ -94,6 +103,83 @@ func init() {
 	// Start background broadcast worker
 	go clusterArray.broadcastWorker()
 	go clusterArray.persistenceWorker()
+}
+
+// getNodeID returns the node identifier for logging
+func (c *Cluster) getNodeID() string {
+	// Explicit override takes priority (1-based index).
+	if idxStr := strings.TrimSpace(os.Getenv("CLUSTER_NODE_INDEX")); idxStr != "" {
+		if idx, err := strconv.Atoi(idxStr); err == nil && idx >= 1 {
+			return fmt.Sprintf("node-%d", idx)
+		}
+	}
+
+	if c.nodeID != "" {
+		return c.nodeID
+	}
+
+	// Fallback if not yet initialized.
+	return "node-unknown"
+}
+
+func normalizeNodeAddr(addr string) string {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return ""
+	}
+
+	// Try host:port first (works for bracketed IPv6 and hostnames with port).
+	if host, _, err := net.SplitHostPort(addr); err == nil {
+		addr = host
+	}
+
+	// Strip brackets if present.
+	addr = strings.TrimPrefix(strings.TrimSuffix(addr, "]"), "[")
+
+	if ip := net.ParseIP(addr); ip != nil {
+		return ip.String()
+	}
+
+	return strings.ToLower(addr)
+}
+
+func (c *Cluster) detectNodeID() string {
+	localCandidates := map[string]struct{}{}
+
+	// Include explicit listen address when it is a concrete IP.
+	if n := normalizeNodeAddr(c.listenAddr); n != "" && n != "::" && n != "0.0.0.0" {
+		localCandidates[n] = struct{}{}
+	}
+
+	// Include all interface IPs.
+	if addrs, err := net.InterfaceAddrs(); err == nil {
+		for _, a := range addrs {
+			switch v := a.(type) {
+			case *net.IPNet:
+				if v.IP != nil {
+					localCandidates[v.IP.String()] = struct{}{}
+				}
+			case *net.IPAddr:
+				if v.IP != nil {
+					localCandidates[v.IP.String()] = struct{}{}
+				}
+			}
+		}
+	}
+
+	// Match local IP/host against peers in configured order.
+	for i, peer := range c.peers {
+		normalizedPeer := normalizeNodeAddr(peer)
+		if normalizedPeer == "" {
+			continue
+		}
+		if _, ok := localCandidates[normalizedPeer]; ok {
+			return fmt.Sprintf("node-%d", i+1)
+		}
+	}
+
+	// If no local match, keep deterministic fallback for troubleshooting.
+	return "node-unknown"
 }
 
 // CreateRuntimeDirectory creates a new runtime directory with current timestamp
@@ -106,7 +192,7 @@ func (c *Cluster) CreateRuntimeDirectory() error {
 	}
 
 	c.runtimePath = runtimePath
-	log.Printf("[CLUSTER] Runtime directory: %s\n", runtimePath)
+	log.Printf("[CLUSTER:%s] Runtime directory: %s\n", c.getNodeID(), runtimePath)
 	return nil
 }
 
@@ -114,7 +200,7 @@ func (c *Cluster) CreateRuntimeDirectory() error {
 func InitClusterArray(env map[string]string, loadLastConfig bool) {
 	// Initialize logging system
 	if err := InitLogger(env); err != nil {
-		log.Printf("[CLUSTER] Failed to initialize logger: %v", err)
+		log.Printf("[CLUSTER:%s] Failed to initialize logger: %v", clusterArray.getNodeID(), err)
 	}
 
 	// Reset slice-based configuration to avoid duplicates when re-initialized.
@@ -143,6 +229,9 @@ func InitClusterArray(env map[string]string, loadLastConfig bool) {
 		clusterArray.listenAddr = addr
 	}
 
+	// Derive node identifier after peers/listen address are loaded.
+	clusterArray.nodeID = clusterArray.detectNodeID()
+
 	// Read encryption key and peer secret from environment
 	if cipherKey, ok := env["CLUSTER_CIPHER_KEY"]; ok && cipherKey != "" {
 		// Try to decode from base64 first, fall back to raw bytes
@@ -158,7 +247,7 @@ func InitClusterArray(env map[string]string, loadLastConfig bool) {
 			key = []byte(cipherKey)
 		} else {
 			// Invalid key length
-			log.Printf("[CLUSTER] Warning: CLUSTER_CIPHER_KEY must be 32 bytes (or base64-encoded 32 bytes), got %d\n", len(cipherKey))
+			log.Printf("[CLUSTER:%s] Warning: CLUSTER_CIPHER_KEY must be 32 bytes (or base64-encoded 32 bytes), got %d\n", clusterArray.getNodeID(), len(cipherKey))
 			key = []byte(cipherKey) // Use as-is (will fail at encryption time with clear error)
 		}
 
@@ -279,7 +368,7 @@ func InitClusterArray(env map[string]string, loadLastConfig bool) {
 	// Load from last config if requested
 	if loadLastConfig {
 		if err := clusterArray.loadFromLastConfig(); err != nil {
-			log.Printf("[CLUSTER] Error loading last config: %v\n", err)
+			log.Printf("[CLUSTER:%s] Error loading last config: %v\n", clusterArray.getNodeID(), err)
 			IncrementErrorCount()
 		}
 	}
@@ -317,7 +406,7 @@ func (c *Cluster) loadFromLastConfig() error {
 
 	latestPath := filepath.Join("runtime", latestDir)
 	c.runtimePath = latestPath
-	// log.Printf("[CLUSTER] Loading from last config: %s\n", latestPath)
+	// log.Printf("[CLUSTER:%s] Loading from last config: %s\n", c.getNodeID(), latestPath)
 
 	// Read all JSON files from the directory
 	files, err := os.ReadDir(latestPath)
@@ -343,7 +432,7 @@ func (c *Cluster) loadFromLastConfig() error {
 		// Read and parse JSON file
 		data, err := os.ReadFile(filePath)
 		if err != nil {
-			log.Printf("[CLUSTER] Error reading file %s: %v\n", filePath, err)
+			log.Printf("[CLUSTER:%s] Error reading file %s: %v\n", c.getNodeID(), filePath, err)
 			continue
 		}
 
@@ -353,7 +442,7 @@ func (c *Cluster) loadFromLastConfig() error {
 		}
 
 		if err := json.Unmarshal(data, &payload); err != nil {
-			log.Printf("[CLUSTER] Error unmarshaling file %s: %v\n", filePath, err)
+			log.Printf("[CLUSTER:%s] Error unmarshaling file %s: %v\n", c.getNodeID(), filePath, err)
 			continue
 		}
 
@@ -369,10 +458,10 @@ func (c *Cluster) loadFromLastConfig() error {
 		c.timestamps[arrayName] = payload.Timestamp
 		c.mu.Unlock()
 
-		// log.Printf("[CLUSTER] Loaded array: %s (%d keys)\n", arrayName, len(payload.Data))
+		// log.Printf("[CLUSTER:%s] Loaded array: %s (%d keys)\n", c.getNodeID(), arrayName, len(payload.Data))
 	}
 
-	log.Printf("[CLUSTER] Loaded %d public arrays and %d private arrays from %s\n", loadedCount, loadedPrivateCount, latestPath)
+	log.Printf("[CLUSTER:%s] Loaded %d public arrays and %d private arrays from %s\n", c.getNodeID(), loadedCount, loadedPrivateCount, latestPath)
 	return nil
 }
 
@@ -380,9 +469,9 @@ func (c *Cluster) queueSave(arrayName string) {
 	select {
 	case c.persistenceChan <- persistenceTask{arrayName: arrayName, delete: false, isPrivate: false}:
 	default:
-		log.Printf("[CLUSTER] Persistence queue full, saving synchronously for array: %s\n", arrayName)
+		log.Printf("[CLUSTER:%s] Persistence queue full, saving synchronously for array: %s\n", c.getNodeID(), arrayName)
 		if err := c.saveArrayToDisk(arrayName); err != nil {
-			log.Printf("[CLUSTER] Error saving array to disk: %v\n", err)
+			log.Printf("[CLUSTER:%s] Error saving array to disk: %v\n", c.getNodeID(), err)
 		}
 	}
 }
@@ -391,9 +480,9 @@ func (c *Cluster) queueSavePrivate(arrayName string) {
 	select {
 	case c.persistenceChan <- persistenceTask{arrayName: arrayName, delete: false, isPrivate: true}:
 	default:
-		log.Printf("[CLUSTER] Persistence queue full, saving synchronously for private array: %s\n", arrayName)
+		log.Printf("[CLUSTER:%s] Persistence queue full, saving synchronously for private array: %s\n", c.getNodeID(), arrayName)
 		if err := c.savePrivateArrayToDisk(arrayName); err != nil {
-			log.Printf("[CLUSTER] Error saving private array to disk: %v\n", err)
+			log.Printf("[CLUSTER:%s] Error saving private array to disk: %v\n", c.getNodeID(), err)
 		}
 	}
 }
@@ -402,9 +491,9 @@ func (c *Cluster) queueDelete(arrayName string) {
 	select {
 	case c.persistenceChan <- persistenceTask{arrayName: arrayName, delete: true, isPrivate: false}:
 	default:
-		log.Printf("[CLUSTER] Persistence queue full, deleting synchronously for array: %s\n", arrayName)
+		log.Printf("[CLUSTER:%s] Persistence queue full, deleting synchronously for array: %s\n", c.getNodeID(), arrayName)
 		if err := c.deleteArrayFromDisk(arrayName); err != nil {
-			log.Printf("[CLUSTER] Error deleting array file: %v\n", err)
+			log.Printf("[CLUSTER:%s] Error deleting array file: %v\n", c.getNodeID(), err)
 		}
 	}
 }
@@ -413,9 +502,9 @@ func (c *Cluster) queueDeletePrivate(arrayName string) {
 	select {
 	case c.persistenceChan <- persistenceTask{arrayName: arrayName, delete: true, isPrivate: true}:
 	default:
-		log.Printf("[CLUSTER] Persistence queue full, deleting synchronously for private array: %s\n", arrayName)
+		log.Printf("[CLUSTER:%s] Persistence queue full, deleting synchronously for private array: %s\n", c.getNodeID(), arrayName)
 		if err := c.deletePrivateArrayFromDisk(arrayName); err != nil {
-			log.Printf("[CLUSTER] Error deleting private array file: %v\n", err)
+			log.Printf("[CLUSTER:%s] Error deleting private array file: %v\n", c.getNodeID(), err)
 		}
 	}
 }
@@ -431,24 +520,24 @@ func (c *Cluster) persistenceWorker() {
 			if task.delete {
 				if task.isPrivate {
 					if err := c.deletePrivateArrayFromDisk(arrayName); err != nil {
-						log.Printf("[CLUSTER] Error deleting private array file: %v\n", err)
+						log.Printf("[CLUSTER:%s] Error deleting private array file: %v\n", c.getNodeID(), err)
 						IncrementErrorCount()
 					}
 				} else {
 					if err := c.deleteArrayFromDisk(arrayName); err != nil {
-						log.Printf("[CLUSTER] Error deleting array file: %v\n", err)
+						log.Printf("[CLUSTER:%s] Error deleting array file: %v\n", c.getNodeID(), err)
 						IncrementErrorCount()
 					}
 				}
 			} else {
 				if task.isPrivate {
 					if err := c.savePrivateArrayToDisk(arrayName); err != nil {
-						log.Printf("[CLUSTER] Error saving private array to disk: %v\n", err)
+						log.Printf("[CLUSTER:%s] Error saving private array to disk: %v\n", c.getNodeID(), err)
 						IncrementErrorCount()
 					}
 				} else {
 					if err := c.saveArrayToDisk(arrayName); err != nil {
-						log.Printf("[CLUSTER] Error saving array to disk: %v\n", err)
+						log.Printf("[CLUSTER:%s] Error saving array to disk: %v\n", c.getNodeID(), err)
 						IncrementErrorCount()
 					}
 				}
@@ -791,12 +880,7 @@ func (c *Cluster) Delete(arrayName, key string) error {
 
 			// Track what to do after lock is released
 			isEmpty := len(c.data[arrayName]) == 0
-
-			if isEmpty {
-				delete(c.timestamps, arrayName)
-			} else {
-				c.timestamps[arrayName] = time.Now()
-			}
+			c.timestamps[arrayName] = time.Now()
 
 			// Release lock BEFORE I/O operations
 			c.mu.Unlock()
@@ -833,7 +917,7 @@ func (c *Cluster) DeleteArray(arrayName string) error {
 	}
 
 	delete(c.data, arrayName)
-	delete(c.timestamps, arrayName)
+	c.timestamps[arrayName] = time.Now()
 
 	// Release lock BEFORE I/O operations
 	c.mu.Unlock()
@@ -911,12 +995,7 @@ func (c *Cluster) DeletePrivate(arrayName, key string) error {
 
 			// Track what to do after lock is released
 			isEmpty := len(c.privateData[arrayName]) == 0
-
-			if isEmpty {
-				delete(c.timestamps, arrayName)
-			} else {
-				c.timestamps[arrayName] = time.Now()
-			}
+			c.timestamps[arrayName] = time.Now()
 
 			// Release lock BEFORE I/O operations
 			c.mu.Unlock()
@@ -949,7 +1028,7 @@ func (c *Cluster) DeletePrivateArray(arrayName string) error {
 	}
 
 	delete(c.privateData, arrayName)
-	delete(c.timestamps, arrayName)
+	c.timestamps[arrayName] = time.Now()
 
 	// Release lock BEFORE I/O operations
 	c.mu.Unlock()
@@ -969,22 +1048,43 @@ func (c *Cluster) GetMetrics() map[string]interface{} {
 	defer c.mu.RUnlock()
 
 	// Convert peer bootup times to a readable format
-	peerBootups := make(map[string]string)
-	displayPeers := make([]string, len(c.peers))
+	peerDetails := make(map[string]map[string]string, len(c.peers))
+	currentTime := time.Now().Format(time.RFC3339)
 
 	for i, peer := range c.peers {
+		displayName := peer
 		if c.ClusterHideIP {
-			nodeName := fmt.Sprintf("node%d", i)
-			displayPeers[i] = nodeName
-			// Map hidden node names to bootup times
-			if bootTime, ok := c.peerBootupTimes[peer]; ok {
-				peerBootups[nodeName] = bootTime.Format(time.RFC3339)
+			displayName = fmt.Sprintf("node%d", i)
+		}
+		normalizedPeer := normalizeNodeAddr(peer)
+
+		bootup := ""
+		if bootTime, ok := c.peerBootupTimes[peer]; ok {
+			bootup = bootTime.Format(time.RFC3339)
+		} else if bootTime, ok := c.peerBootupTimes[normalizedPeer]; ok {
+			bootup = bootTime.Format(time.RFC3339)
+		}
+
+		lastSeen := ""
+		status := "offline"
+		if seenAt, ok := c.peerLastSeen[peer]; ok {
+			lastSeen = seenAt.Format(time.RFC3339)
+			if time.Since(seenAt) <= peerAliveTTL {
+				status = "online"
 			}
-		} else {
-			displayPeers[i] = peer
-			if bootTime, ok := c.peerBootupTimes[peer]; ok {
-				peerBootups[peer] = bootTime.Format(time.RFC3339)
+		} else if seenAt, ok := c.peerLastSeen[normalizedPeer]; ok {
+			lastSeen = seenAt.Format(time.RFC3339)
+			if time.Since(seenAt) <= peerAliveTTL {
+				status = "online"
 			}
+		}
+
+		peerDetails[displayName] = map[string]string{
+			"node_id":        strconv.Itoa(i + 1),
+			"bootup_time":    bootup,
+			"current_status": status,
+			"last_seen":      lastSeen,
+			"current_time":   currentTime,
 		}
 	}
 
@@ -994,7 +1094,17 @@ func (c *Cluster) GetMetrics() map[string]interface{} {
 	if peerCount == 0 {
 		health = "disabled"
 	} else {
-		responsivePeers := len(c.peerBootupTimes)
+		responsivePeers := 0
+		for _, peer := range c.peers {
+			normalizedPeer := normalizeNodeAddr(peer)
+			seenAt, ok := c.peerLastSeen[peer]
+			if !ok {
+				seenAt, ok = c.peerLastSeen[normalizedPeer]
+			}
+			if ok && time.Since(seenAt) <= peerAliveTTL {
+				responsivePeers++
+			}
+		}
 		if responsivePeers == peerCount {
 			health = "healthy"
 		} else if responsivePeers > 0 {
@@ -1005,17 +1115,17 @@ func (c *Cluster) GetMetrics() map[string]interface{} {
 	}
 
 	return map[string]interface{}{
-		"bootup_time":       c.bootupTime.Format(time.RFC3339),
-		"uptime_seconds":    int64(time.Since(c.bootupTime).Seconds()),
-		"last_sync":         c.lastSyncTime.Format(time.RFC3339),
-		"total_syncs":       c.syncCount,
-		"failed_syncs":      c.failedSyncs,
-		"total_sync_bytes":  c.totalSyncBytes,
-		"error_count":       c.errorCount,
-		"peer_count":        len(c.peers),
-		"peers":             displayPeers,
-		"peer_bootup_times": peerBootups,
-		"health":            health,
+		"bootup_time":      c.bootupTime.Format(time.RFC3339),
+		"current_node_id":  c.getNodeID(),
+		"uptime_seconds":   int64(time.Since(c.bootupTime).Seconds()),
+		"last_sync":        c.lastSyncTime.Format(time.RFC3339),
+		"total_syncs":      c.syncCount,
+		"failed_syncs":     c.failedSyncs,
+		"total_sync_bytes": c.totalSyncBytes,
+		"error_count":      c.errorCount,
+		"peer_count":       len(c.peers),
+		"peers":            peerDetails,
+		"health":           health,
 	}
 }
 
@@ -1092,31 +1202,48 @@ func (c *Cluster) GetArray(arrayName string) map[string]string {
 func (c *Cluster) UpdateFromPeer(data map[string]map[string]string, timestamps map[string]time.Time) {
 	c.mu.Lock()
 
-	// Track which arrays need to be saved
+	// Track which arrays need disk updates
 	arraysToBeSaved := []string{}
+	arraysToBeDeleted := []string{}
 
-	for arrayName, array := range data {
-		peerTimestamp := timestamps[arrayName]
+	for arrayName, peerTimestamp := range timestamps {
+		if peerTimestamp.IsZero() {
+			continue
+		}
 		localTimestamp := c.timestamps[arrayName]
 
-		// If array is empty locally or peer data is newer, update it
-		if len(c.data[arrayName]) == 0 || peerTimestamp.After(localTimestamp) {
+		// Apply only newer peer state to avoid resurrecting stale values.
+		if localTimestamp.IsZero() || peerTimestamp.After(localTimestamp) {
+			array, exists := data[arrayName]
+			if !exists {
+				// Tombstone/full-array delete propagated by timestamp without data.
+				delete(c.data, arrayName)
+				c.timestamps[arrayName] = peerTimestamp
+				arraysToBeDeleted = append(arraysToBeDeleted, arrayName)
+				continue
+			}
+
 			if c.data[arrayName] == nil {
 				c.data[arrayName] = make(map[string]string)
+			}
+			// Replace current contents with peer contents (including empty maps).
+			for k := range c.data[arrayName] {
+				delete(c.data[arrayName], k)
 			}
 			for k, v := range array {
 				c.data[arrayName][k] = v
 			}
 
-			// Only set timestamp if array is not empty
-			if len(array) > 0 {
-				c.timestamps[arrayName] = peerTimestamp
+			c.timestamps[arrayName] = peerTimestamp
+			if len(array) == 0 {
+				arraysToBeDeleted = append(arraysToBeDeleted, arrayName)
+			} else {
 				arraysToBeSaved = append(arraysToBeSaved, arrayName)
 			}
 		}
 	}
 
-	log.Printf("[CLUSTER] Merged data from peer\n")
+	log.Printf("[CLUSTER:%s] Merged data from peer\n", c.getNodeID())
 
 	// Release lock BEFORE I/O operations
 	c.mu.Unlock()
@@ -1125,37 +1252,57 @@ func (c *Cluster) UpdateFromPeer(data map[string]map[string]string, timestamps m
 	for _, arrayName := range arraysToBeSaved {
 		c.queueSave(arrayName)
 	}
+	for _, arrayName := range arraysToBeDeleted {
+		c.queueDelete(arrayName)
+	}
 }
 
 // UpdateFromPeerPrivate merges private data from a peer based on timestamps
 func (c *Cluster) UpdateFromPeerPrivate(data map[string]map[string]string, timestamps map[string]time.Time) {
 	c.mu.Lock()
 
-	// Track which arrays need to be saved
+	// Track which arrays need disk updates
 	arraysToBeSaved := []string{}
+	arraysToBeDeleted := []string{}
 
-	for arrayName, array := range data {
-		peerTimestamp := timestamps[arrayName]
+	for arrayName, peerTimestamp := range timestamps {
+		if peerTimestamp.IsZero() {
+			continue
+		}
 		localTimestamp := c.timestamps[arrayName]
 
-		// If array is empty locally or peer data is newer, update it
-		if len(c.privateData[arrayName]) == 0 || peerTimestamp.After(localTimestamp) {
+		// Apply only newer peer state to avoid resurrecting stale values.
+		if localTimestamp.IsZero() || peerTimestamp.After(localTimestamp) {
+			array, exists := data[arrayName]
+			if !exists {
+				// Tombstone/full-array delete propagated by timestamp without data.
+				delete(c.privateData, arrayName)
+				c.timestamps[arrayName] = peerTimestamp
+				arraysToBeDeleted = append(arraysToBeDeleted, arrayName)
+				continue
+			}
+
 			if c.privateData[arrayName] == nil {
 				c.privateData[arrayName] = make(map[string]string)
+			}
+			// Replace current contents with peer contents (including empty maps).
+			for k := range c.privateData[arrayName] {
+				delete(c.privateData[arrayName], k)
 			}
 			for k, v := range array {
 				c.privateData[arrayName][k] = v
 			}
 
-			// Only set timestamp if array is not empty
-			if len(array) > 0 {
-				c.timestamps[arrayName] = peerTimestamp
+			c.timestamps[arrayName] = peerTimestamp
+			if len(array) == 0 {
+				arraysToBeDeleted = append(arraysToBeDeleted, arrayName)
+			} else {
 				arraysToBeSaved = append(arraysToBeSaved, arrayName)
 			}
 		}
 	}
 
-	log.Printf("[CLUSTER] Merged private data from peer\n")
+	log.Printf("[CLUSTER:%s] Merged private data from peer\n", c.getNodeID())
 
 	// Release lock BEFORE I/O operations
 	c.mu.Unlock()
@@ -1163,6 +1310,9 @@ func (c *Cluster) UpdateFromPeerPrivate(data map[string]map[string]string, times
 	// Save to disk asynchronously (without lock)
 	for _, arrayName := range arraysToBeSaved {
 		c.queueSavePrivate(arrayName)
+	}
+	for _, arrayName := range arraysToBeDeleted {
+		c.queueDeletePrivate(arrayName)
 	}
 }
 
@@ -1177,14 +1327,14 @@ func (c *Cluster) syncFromPeersOnStartup() {
 			for attempt := 0; attempt < maxRetries; attempt++ {
 				if attempt > 0 {
 					delay := time.Duration(attempt*2) * time.Second
-					log.Printf("[CLUSTER] Retrying sync from peer %s in %v (attempt %d/%d)\n", peerAddr, delay, attempt+1, maxRetries)
+					log.Printf("[CLUSTER:%s] Retrying sync from peer %s in %v (attempt %d/%d)\n", clusterArray.getNodeID(), peerAddr, delay, attempt+1, maxRetries)
 					time.Sleep(delay)
 				}
 
 				conn, err := net.DialTimeout("tcp", formatPeerAddr(peerAddr)+":9000", 5*time.Second)
 				if err != nil {
 					if attempt == maxRetries-1 {
-						log.Printf("[CLUSTER] Failed to sync from peer %s after %d attempts: %v\n", peerAddr, maxRetries, err)
+						log.Printf("[CLUSTER:%s] Failed to sync from peer %s after %d attempts: %v\n", clusterArray.getNodeID(), peerAddr, maxRetries, err)
 						IncrementErrorCount()
 					}
 					continue
@@ -1201,7 +1351,7 @@ func (c *Cluster) syncFromPeersOnStartup() {
 				// Wait for auth response
 				authResp, err := reader.ReadString('\n')
 				if err != nil || strings.TrimSpace(authResp) != "AUTH_OK" {
-					log.Printf("[CLUSTER] Authentication failed with peer %s\n", peerAddr)
+					log.Printf("[CLUSTER:%s] Authentication failed with peer %s\n", clusterArray.getNodeID(), peerAddr)
 					continue
 				}
 
@@ -1210,14 +1360,14 @@ func (c *Cluster) syncFromPeersOnStartup() {
 
 				line, err := reader.ReadString('\n')
 				if err != nil {
-					log.Printf("[CLUSTER] Error reading from peer %s: %v\n", peerAddr, err)
+					log.Printf("[CLUSTER:%s] Error reading from peer %s: %v\n", clusterArray.getNodeID(), peerAddr, err)
 					continue
 				}
 
 				// Decrypt the response
 				jsonStr, err := c.decryptMessage(strings.TrimSpace(line))
 				if err != nil {
-					log.Printf("[CLUSTER] Decryption failed: %v\n", err)
+					log.Printf("[CLUSTER:%s] Decryption failed: %v\n", clusterArray.getNodeID(), err)
 					IncrementErrorCount()
 					continue
 				}
@@ -1231,7 +1381,7 @@ func (c *Cluster) syncFromPeersOnStartup() {
 				}
 
 				if err := json.Unmarshal([]byte(jsonStr), &payload); err != nil {
-					log.Printf("[CLUSTER] Error unmarshaling peer data: %v\n", err)
+					log.Printf("[CLUSTER:%s] Error unmarshaling peer data: %v\n", clusterArray.getNodeID(), err)
 					continue
 				}
 
@@ -1239,12 +1389,15 @@ func (c *Cluster) syncFromPeersOnStartup() {
 				if !payload.BootupTime.IsZero() {
 					c.mu.Lock()
 					c.peerBootupTimes[peerAddr] = payload.BootupTime
+					c.peerBootupTimes[normalizeNodeAddr(peerAddr)] = payload.BootupTime
+					c.peerLastSeen[peerAddr] = time.Now()
+					c.peerLastSeen[normalizeNodeAddr(peerAddr)] = time.Now()
 					c.mu.Unlock()
 				}
 
 				c.UpdateFromPeer(payload.Data, payload.Timestamps)
 				c.UpdateFromPeerPrivate(payload.PrivateData, payload.Timestamps)
-				log.Printf("[CLUSTER] Successfully synced from peer %s on startup\n", peerAddr)
+				log.Printf("[CLUSTER:%s] Successfully synced from peer %s on startup\n", clusterArray.getNodeID(), peerAddr)
 				return // Success, exit retry loop
 			}
 		}(peer)
@@ -1252,6 +1405,9 @@ func (c *Cluster) syncFromPeersOnStartup() {
 
 	// Start periodic background sync to keep in sync with peers
 	go c.periodicPeerSync()
+
+	// Start fast heartbeat loop for near-immediate peer liveness detection.
+	go c.peerHeartbeatLoop()
 }
 
 // formatPeerAddr wraps IPv6 addresses in brackets for net.Dial
@@ -1320,6 +1476,9 @@ func (c *Cluster) periodicPeerSync() {
 				if !payload.BootupTime.IsZero() {
 					c.mu.Lock()
 					c.peerBootupTimes[peerAddr] = payload.BootupTime
+					c.peerBootupTimes[normalizeNodeAddr(peerAddr)] = payload.BootupTime
+					c.peerLastSeen[peerAddr] = time.Now()
+					c.peerLastSeen[normalizeNodeAddr(peerAddr)] = time.Now()
 					c.mu.Unlock()
 				}
 
@@ -1330,22 +1489,77 @@ func (c *Cluster) periodicPeerSync() {
 	}
 }
 
+// peerHeartbeatLoop performs lightweight authenticated pings to peers every second.
+func (c *Cluster) peerHeartbeatLoop() {
+	ticker := time.NewTicker(peerHeartbeatInterval)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		for _, peer := range c.peers {
+			c.pingPeer(peer)
+		}
+	}
+}
+
+func (c *Cluster) pingPeer(peerAddr string) {
+	conn, err := net.DialTimeout("tcp", formatPeerAddr(peerAddr)+":9000", peerHeartbeatTimeout)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+
+	_ = conn.SetDeadline(time.Now().Add(peerHeartbeatTimeout))
+
+	reader := bufio.NewReader(conn)
+	writer := bufio.NewWriter(conn)
+
+	// Send peer secret for authentication
+	fmt.Fprintf(writer, "%s\n", c.peerSecret)
+	if err := writer.Flush(); err != nil {
+		return
+	}
+
+	// Wait for auth response
+	authResp, err := reader.ReadString('\n')
+	if err != nil || strings.TrimSpace(authResp) != "AUTH_OK" {
+		return
+	}
+
+	// Lightweight ping command
+	fmt.Fprintf(writer, "PING\n")
+	if err := writer.Flush(); err != nil {
+		return
+	}
+
+	pong, err := reader.ReadString('\n')
+	if err != nil || strings.TrimSpace(pong) != "PONG" {
+		return
+	}
+
+	now := time.Now()
+	normalized := normalizeNodeAddr(peerAddr)
+	c.mu.Lock()
+	c.peerLastSeen[peerAddr] = now
+	c.peerLastSeen[normalized] = now
+	c.mu.Unlock()
+}
+
 // startPeerSyncServer starts a TCP server for peer synchronization
 func (c *Cluster) startPeerSyncServer(port string) {
 	addr := c.listenAddr + ":" + port
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
-		log.Printf("[CLUSTER] Error starting peer sync server: %v\n", err)
+		log.Printf("[CLUSTER:%s] Error starting peer sync server: %v\n", c.getNodeID(), err)
 		return
 	}
 	defer listener.Close()
 
-	log.Printf("[CLUSTER] Peer sync server started on %s\n", addr)
+	log.Printf("[CLUSTER:%s] Peer sync server started on %s\n", c.getNodeID(), addr)
 
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			log.Printf("[CLUSTER] Error accepting connection: %v\n", err)
+			log.Printf("[CLUSTER:%s] Error accepting connection: %v\n", c.getNodeID(), err)
 			continue
 		}
 
@@ -1359,7 +1573,7 @@ func (c *Cluster) handlePeerConnection(conn net.Conn) {
 
 	// Check IP whitelist first
 	if !c.isIPAllowed(conn.RemoteAddr().String(), c.clusterWhitelist) {
-		log.Printf("[CLUSTER] Rejected connection from %s: IP not whitelisted\n", conn.RemoteAddr())
+		log.Printf("[CLUSTER:%s] Rejected connection from %s: IP not whitelisted\n", c.getNodeID(), conn.RemoteAddr())
 		return
 	}
 
@@ -1369,13 +1583,13 @@ func (c *Cluster) handlePeerConnection(conn net.Conn) {
 	// Step 1: Receive and verify peer secret
 	secretLine, err := reader.ReadString('\n')
 	if err != nil {
-		log.Printf("[CLUSTER] Error reading peer secret: %v\n", err)
+		log.Printf("[CLUSTER:%s] Error reading peer secret: %v\n", c.getNodeID(), err)
 		return
 	}
 
 	secretLine = strings.TrimSpace(secretLine)
 	if secretLine != c.peerSecret {
-		log.Printf("[CLUSTER] Invalid peer secret from %s\n", conn.RemoteAddr())
+		log.Printf("[CLUSTER:%s] Invalid peer secret from %s\n", c.getNodeID(), conn.RemoteAddr())
 		fmt.Fprintf(writer, "AUTH_FAILED\n")
 		writer.Flush()
 		return
@@ -1384,12 +1598,23 @@ func (c *Cluster) handlePeerConnection(conn net.Conn) {
 	// Authentication successful
 	fmt.Fprintf(writer, "AUTH_OK\n")
 	writer.Flush()
-	log.Printf("[CLUSTER] Peer authenticated from %s\n", conn.RemoteAddr())
+	log.Printf("[CLUSTER:%s] Peer authenticated from %s\n", c.getNodeID(), conn.RemoteAddr())
+
+	// Mark peer as recently seen once authenticated.
+	remoteAddr := conn.RemoteAddr().String()
+	if host, _, err := net.SplitHostPort(remoteAddr); err == nil {
+		remoteAddr = host
+	}
+	remoteAddr = strings.TrimPrefix(strings.TrimSuffix(remoteAddr, "]"), "[")
+	c.mu.Lock()
+	c.peerLastSeen[remoteAddr] = time.Now()
+	c.peerLastSeen[normalizeNodeAddr(remoteAddr)] = time.Now()
+	c.mu.Unlock()
 
 	// Step 2: Read command
 	line, err := reader.ReadString('\n')
 	if err != nil {
-		log.Printf("[CLUSTER] Error reading command from peer: %v\n", err)
+		log.Printf("[CLUSTER:%s] Error reading command from peer: %v\n", c.getNodeID(), err)
 		return
 	}
 
@@ -1410,7 +1635,7 @@ func (c *Cluster) handlePeerConnection(conn net.Conn) {
 		// Encrypt the response
 		encrypted, err := c.encryptMessage(string(jsonData))
 		if err != nil {
-			log.Printf("[CLUSTER] Encryption failed: %v\n", err)
+			log.Printf("[CLUSTER:%s] Encryption failed: %v\n", c.getNodeID(), err)
 			return
 		}
 
@@ -1424,18 +1649,25 @@ func (c *Cluster) handlePeerConnection(conn net.Conn) {
 
 		c.mu.Lock()
 		c.peerBootupTimes[remoteAddr] = c.bootupTime
+		c.peerBootupTimes[normalizeNodeAddr(remoteAddr)] = c.bootupTime
+		c.peerLastSeen[remoteAddr] = time.Now()
+		c.peerLastSeen[normalizeNodeAddr(remoteAddr)] = time.Now()
 		c.mu.Unlock()
 
 		fmt.Fprintf(writer, "%s\n", encrypted)
 		writer.Flush()
-		log.Printf("[CLUSTER] Sent encrypted arrays to peer\n")
+		log.Printf("[CLUSTER:%s] Sent encrypted arrays to peer\n", c.getNodeID())
+	} else if line == "PING" {
+		fmt.Fprintf(writer, "PONG\n")
+		writer.Flush()
+		return
 	} else if strings.HasPrefix(line, "UPDATE ") {
 		encryptedData := strings.TrimPrefix(line, "UPDATE ")
 
 		// Decrypt the update
 		jsonStr, err := c.decryptMessage(encryptedData)
 		if err != nil {
-			log.Printf("[CLUSTER] Decryption failed: %v\n", err)
+			log.Printf("[CLUSTER:%s] Decryption failed: %v\n", clusterArray.getNodeID(), err)
 			return
 		}
 
@@ -1447,7 +1679,7 @@ func (c *Cluster) handlePeerConnection(conn net.Conn) {
 		}
 
 		if err := json.Unmarshal([]byte(jsonStr), &payload); err != nil {
-			log.Printf("[CLUSTER] Error unmarshaling update data: %v\n", err)
+			log.Printf("[CLUSTER:%s] Error unmarshaling update data: %v\n", c.getNodeID(), err)
 			return
 		}
 
@@ -1462,6 +1694,9 @@ func (c *Cluster) handlePeerConnection(conn net.Conn) {
 			// Strip brackets from IPv6 addresses for consistent key format
 			remoteAddr = strings.TrimPrefix(strings.TrimSuffix(remoteAddr, "]"), "[")
 			c.peerBootupTimes[remoteAddr] = payload.BootupTime
+			c.peerBootupTimes[normalizeNodeAddr(remoteAddr)] = payload.BootupTime
+			c.peerLastSeen[remoteAddr] = time.Now()
+			c.peerLastSeen[normalizeNodeAddr(remoteAddr)] = time.Now()
 			c.mu.Unlock()
 		}
 
@@ -1524,7 +1759,7 @@ func (c *Cluster) broadcastWorker() {
 				// Wait for auth response
 				authResp, err := reader.ReadString('\n')
 				if err != nil || strings.TrimSpace(authResp) != "AUTH_OK" {
-					log.Printf("[CLUSTER] Authentication failed with peer %s\n", peerAddr)
+					log.Printf("[CLUSTER:%s] Authentication failed with peer %s\n", clusterArray.getNodeID(), peerAddr)
 					c.mu.Lock()
 					c.failedSyncs++
 					c.mu.Unlock()
@@ -1534,10 +1769,7 @@ func (c *Cluster) broadcastWorker() {
 				// Encrypt the update
 				encrypted, err := c.encryptMessage(string(jsonData))
 				if err != nil {
-					log.Printf("[CLUSTER] Encryption failed: %v\n", err)
-					c.mu.Lock()
-					c.failedSyncs++
-					c.mu.Unlock()
+					log.Printf("[CLUSTER:%s] Encryption failed: %v\n", c.getNodeID(), err)
 					return
 				}
 
@@ -1610,7 +1842,7 @@ func (c *Cluster) Import(clearFirst bool) error {
 		c.data = make(map[string]map[string]string)
 		c.privateData = make(map[string]map[string]string)
 		c.timestamps = make(map[string]time.Time)
-		log.Printf("[CLUSTER] Cleared all existing arrays before import\n")
+		log.Printf("[CLUSTER:%s] Cleared all existing arrays before import\n", clusterArray.getNodeID())
 	}
 
 	// Determine format and extract data/timestamps
@@ -1709,7 +1941,7 @@ func (c *Cluster) Import(clearFirst bool) error {
 		c.queueSavePrivate(arrayName)
 	}
 
-	log.Printf("[CLUSTER] Imported %d public arrays and %d private arrays\n", len(dataMap), len(privateDataMap))
+	log.Printf("[CLUSTER:%s] Imported %d public arrays and %d private arrays\n", clusterArray.getNodeID(), len(dataMap), len(privateDataMap))
 	return nil
 }
 
