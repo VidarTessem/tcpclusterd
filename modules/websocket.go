@@ -186,12 +186,8 @@ func sendWSData(conn *websocket.Conn, arrayName string) error {
 	if arrayName == "" {
 		data = GetAllWithMetrics()
 	} else {
-		data = map[string]interface{}{
-			"arrays": map[string]map[string]string{
-				arrayName: GetArray(arrayName),
-			},
-			"metrics": GetClusterInstance().GetMetrics(),
-		}
+		// When filtering by specific array, return just the array data (like HTTP endpoint)
+		data = GetArray(arrayName)
 	}
 
 	conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
