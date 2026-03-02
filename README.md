@@ -721,7 +721,7 @@ All three protocols (HTTP, Cluster, TCP) support IP whitelisting with CIDR subne
 
 Comma-separated list of:
 - Exact IP: `127.0.0.1`, `::1`
-- CIDR subnets: `192.168.0.0/16`, `2a03:94e0:205b::/48`
+- CIDR subnets: `192.168.0.0/16`, `10.0.0.0/8`
 - Any IPv4: `0.0.0.0/0`
 - Any IPv6: `::/0`
 
@@ -748,7 +748,7 @@ TCP_WHITELIST_IPS=127.0.0.1,::1,172.16.0.0/12
 
 ```bash
 # ISP subnet and office network
-HTTP_WHITELIST_IPS=2a03:94e0:205b::/48,203.0.113.0/24,198.51.100.0/24
+HTTP_WHITELIST_IPS=192.168.0.0/24,203.0.113.0/24,198.51.100.0/24
 
 # Single peer in cluster
 CLUSTER_WHITELIST_IPS=192.168.1.100,192.168.1.101
