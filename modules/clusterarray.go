@@ -56,6 +56,8 @@ type Cluster struct {
 	peerBootupTimes  map[string]time.Time              // Bootup times of peer nodes
 	wsSubscriptions  map[string][]chan WebSocketUpdate // Array name -> list of subscriber channels
 	wsSubMu          sync.RWMutex                      // Lock for wsSubscriptions
+	adminUsername    string                            // Admin username for authentication
+	adminPassword    string                            // Admin password for authentication
 }
 
 type persistenceTask struct {
@@ -200,6 +202,18 @@ func InitClusterArray(env map[string]string, loadLastConfig bool) {
 				clusterArray.tcpWhitelist = append(clusterArray.tcpWhitelist, ip)
 			}
 		}
+	}
+
+	// Load admin credentials for authentication
+	if adminUsername, ok := env["ADMIN_USERNAME"]; ok && adminUsername != "" {
+		clusterArray.adminUsername = adminUsername
+	} else {
+		clusterArray.adminUsername = "admin"
+	}
+	if adminPassword, ok := env["ADMIN_PASSWORD"]; ok && adminPassword != "" {
+		clusterArray.adminPassword = adminPassword
+	} else {
+		clusterArray.adminPassword = "changeme"
 	}
 
 	// Parse WebSocket configuration

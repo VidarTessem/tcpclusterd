@@ -72,17 +72,8 @@ func (c *Cluster) handleTCPConnection(conn net.Conn, key string) {
 			if len(parts) == 3 {
 				creds := strings.SplitN(parts[2], ":", 2)
 				if len(creds) == 2 {
-					// Load admin credentials from env
-					env := LoadEnvFile(".env")
-					adminUser := env["ADMIN_USERNAME"]
-					adminPass := env["ADMIN_PASSWORD"]
-					if adminUser == "" {
-						adminUser = "admin"
-					}
-					if adminPass == "" {
-						adminPass = "changeme"
-					}
-					if creds[0] == adminUser && creds[1] == adminPass {
+					// Check admin credentials from Cluster struct (loaded at startup)
+					if creds[0] == c.adminUsername && creds[1] == c.adminPassword {
 						authLevel = 2
 						log.Printf("[TCP] Client authenticated with admin access from %s\n", conn.RemoteAddr())
 					} else {
