@@ -148,13 +148,31 @@ func (c *Cluster) handleTCPGet(writer *bufio.Writer, parts []string, authLevel i
 	if len(parts) < 2 {
 		// Return all arrays based on auth level
 		if authLevel >= 2 {
-			data = GetAllWithMetricsAndPrivate()
+			data = c.GetAllWithMetricsAndPrivate()
 		} else {
-			data = GetAllWithMetrics()
+			data = c.GetAllWithMetrics()
 		}
 	} else {
-		arrayName := strings.TrimSpace(parts[1])
-		data = GetArray(arrayName)
+		param := strings.ToUpper(strings.TrimSpace(parts[1]))
+
+		// Handle GET PUBLIC and GET PRIVATE commands
+		if param == "PUBLIC" {
+			data = c.GetAllWithMetrics()
+		} else if param == "PRIVATE" {
+			if authLevel < 2 {
+				fmt.Fprintf(writer, "ERROR: Authentication required for private arrays\n")
+				return
+			}
+			// Return only private arrays with metrics
+			allData := c.GetAllWithMetricsAndPrivate()
+			data = map[string]interface{}{
+				"private_arrays": allData["private_arrays"],
+				"metrics":        allData["metrics"],
+			}
+		} else {
+			// Get specific array by name
+			data = GetArray(param)
+		}
 	}
 
 	jsonData, err := json.Marshal(data)
