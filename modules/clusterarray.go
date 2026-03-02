@@ -18,6 +18,13 @@ import (
 	"time"
 )
 
+// WebSocketUpdate represents an update pushed to WebSocket clients
+type WebSocketUpdate struct {
+	ArrayName string            `json:"array_name"`
+	Data      map[string]string `json:"data"`
+	Timestamp time.Time         `json:"timestamp"`
+}
+
 // Cluster represents a distributed cluster array instance
 type Cluster struct {
 	data             map[string]map[string]string
@@ -45,8 +52,10 @@ type Cluster struct {
 	tcpKey           string
 	WsEnabled        bool
 	HttpEnabled      bool
-	bootupTime       time.Time            // Time when this cluster node started
-	peerBootupTimes  map[string]time.Time // Bootup times of peer nodes
+	bootupTime       time.Time                         // Time when this cluster node started
+	peerBootupTimes  map[string]time.Time              // Bootup times of peer nodes
+	wsSubscriptions  map[string][]chan WebSocketUpdate // Array name -> list of subscriber channels
+	wsSubMu          sync.RWMutex                      // Lock for wsSubscriptions
 }
 
 type persistenceTask struct {
@@ -70,6 +79,7 @@ func init() {
 		persistenceChan: make(chan persistenceTask, 2048),
 		bootupTime:      time.Now(),
 		peerBootupTimes: make(map[string]time.Time),
+		wsSubscriptions: make(map[string][]chan WebSocketUpdate),
 	}
 
 	// Start background broadcast worker
@@ -647,6 +657,9 @@ func (c *Cluster) Write(arrayName, value string) error {
 	// Broadcast to peers asynchronously
 	c.broadcastToPeers()
 
+	// Notify WebSocket subscribers
+	c.BroadcastArrayUpdate(arrayName)
+
 	return nil
 }
 
@@ -704,6 +717,9 @@ func (c *Cluster) Update(arrayName, value string) error {
 	// Broadcast to peers asynchronously
 	c.broadcastToPeers()
 
+	// Notify WebSocket subscribers
+	c.BroadcastArrayUpdate(arrayName)
+
 	return nil
 }
 
@@ -736,6 +752,10 @@ func (c *Cluster) Delete(arrayName, key string) error {
 
 			// Broadcast to peers asynchronously
 			c.broadcastToPeers()
+
+			// Notify WebSocket subscribers
+			c.BroadcastArrayUpdate(arrayName)
+
 			return nil
 		}
 		c.mu.Unlock()
@@ -802,6 +822,9 @@ func (c *Cluster) WritePrivate(arrayName, value string) error {
 
 	// Broadcast to peers asynchronously
 	c.broadcastToPeers()
+
+	// Notify WebSocket subscribers (private arrays use same broadcast)
+	c.BroadcastArrayUpdate(arrayName)
 
 	return nil
 }
@@ -1604,4 +1627,82 @@ func (c *Cluster) convertInterfaceToStringMap(data map[string]interface{}) map[s
 		}
 	}
 	return result
+}
+
+// SubscribeToArray subscribes a channel to receive updates for a specific array
+func (c *Cluster) SubscribeToArray(arrayName string) <-chan WebSocketUpdate {
+	c.wsSubMu.Lock()
+	defer c.wsSubMu.Unlock()
+
+	// Create a buffered channel for this subscriber
+	updateChan := make(chan WebSocketUpdate, 10)
+
+	// Add subscriber to the list for this array
+	if c.wsSubscriptions[arrayName] == nil {
+		c.wsSubscriptions[arrayName] = make([]chan WebSocketUpdate, 0)
+	}
+	c.wsSubscriptions[arrayName] = append(c.wsSubscriptions[arrayName], updateChan)
+
+	return updateChan
+}
+
+// UnsubscribeFromArray removes a subscriber channel from the list
+func (c *Cluster) UnsubscribeFromArray(arrayName string, updateChan chan WebSocketUpdate) {
+	c.wsSubMu.Lock()
+	defer c.wsSubMu.Unlock()
+
+	if subscribers, ok := c.wsSubscriptions[arrayName]; ok {
+		// Find and remove the channel
+		for i, ch := range subscribers {
+			if ch == updateChan {
+				// Remove from slice
+				c.wsSubscriptions[arrayName] = append(subscribers[:i], subscribers[i+1:]...)
+				close(ch)
+				break
+			}
+		}
+
+		// Clean up empty arrays
+		if len(c.wsSubscriptions[arrayName]) == 0 {
+			delete(c.wsSubscriptions, arrayName)
+		}
+	}
+}
+
+// BroadcastArrayUpdate sends an update to all subscribers of an array
+func (c *Cluster) BroadcastArrayUpdate(arrayName string) {
+	c.wsSubMu.RLock()
+	subscribers, ok := c.wsSubscriptions[arrayName]
+	c.wsSubMu.RUnlock()
+
+	if !ok || len(subscribers) == 0 {
+		return // No subscribers for this array
+	}
+
+	c.mu.RLock()
+	data := make(map[string]string)
+	if arr, exists := c.data[arrayName]; exists {
+		for k, v := range arr {
+			data[k] = v
+		}
+	}
+	ts := c.timestamps[arrayName]
+	c.mu.RUnlock()
+
+	update := WebSocketUpdate{
+		ArrayName: arrayName,
+		Data:      data,
+		Timestamp: ts,
+	}
+
+	// Send update to all subscribers (non-blocking)
+	for _, ch := range subscribers {
+		select {
+		case ch <- update:
+			// Sent successfully
+		default:
+			// Channel full, skip to avoid blocking
+			log.Printf("[WS] Dropped update for subscriber (channel full)\n")
+		}
+	}
 }
