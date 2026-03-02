@@ -130,6 +130,27 @@ HTTP_LISTEN_ADDR=[::]
 HTTP_WHITELIST_IPS=0.0.0.0/0,::/0
 ```
 
+#### HTTPS Server Configuration
+
+```bash
+# Enable/disable HTTPS server (default: false)
+HTTPS_ENABLED=false
+
+# HTTPS server port
+HTTPS_PORT=8443
+
+# Listen address for HTTPS
+HTTPS_LISTEN_ADDR=[::]
+
+# Required when HTTPS_ENABLED=true
+HTTPS_CERT_FILE=/etc/ssl/certs/fullchain.pem
+HTTPS_KEY_FILE=/etc/ssl/private/privkey.pem
+
+# Optional virtual host override (comma-separated)
+# If empty, domains are auto-detected from certificate SAN/CN
+LISTEN_DOMAINS=api.example.com,cluster.example.com
+```
+
 #### WebSocket Configuration
 
 ```bash
@@ -155,8 +176,8 @@ Use this in production if you want persistent server logs on disk.
 
 ```bash
 # Peer nodes to sync with (comma-separated addresses)
-# Format: host:port (without CLUSTER_PORT, just hostname:port)
-CLUSTER_PEERS=[::1]
+# Format: host:port (must include port)
+CLUSTER_PEERS=[2a03:94e0:205b:d:2::aaab]:9000,[2a03:94e0:205b:d:2::aaac]:9000
 
 # Cluster sync server port
 CLUSTER_PORT=9000
@@ -1104,7 +1125,7 @@ services:
       - "9000:9000"
       - "9001:9001"
     environment:
-      PORT: 8888
+      HTTP_PORT: 8888
       CLUSTER_PEERS: cluster-node2:9000,cluster-node3:9000
       CLUSTER_PORT: 9000
       CLUSTER_CIPHER_KEY: q6BZQxonmHjGTLQsHlQCOTZB27r5VPHHhdI6+r5foLo=
@@ -1115,7 +1136,7 @@ services:
   cluster-node2:
     image: cluster-app:latest
     environment:
-      PORT: 8888
+      HTTP_PORT: 8888
       CLUSTER_PEERS: cluster-node1:9000,cluster-node3:9000
       CLUSTER_PORT: 9000
       CLUSTER_CIPHER_KEY: q6BZQxonmHjGTLQsHlQCOTZB27r5VPHHhdI6+r5foLo=
@@ -1126,7 +1147,7 @@ services:
   cluster-node3:
     image: cluster-app:latest
     environment:
-      PORT: 8888
+      HTTP_PORT: 8888
       CLUSTER_PEERS: cluster-node1:9000,cluster-node2:9000
       CLUSTER_PORT: 9000
       CLUSTER_CIPHER_KEY: q6BZQxonmHjGTLQsHlQCOTZB27r5VPHHhdI6+r5foLo=

@@ -3,10 +3,13 @@ package modules
 import (
 	"bufio"
 	"crypto/rand"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -67,6 +70,17 @@ HTTP_PORT=8888
 HTTP_LISTEN_ADDR=[::]
 HTTP_WHITELIST_IPS=0.0.0.0/0,::/0
 
+	# HTTPS server configuration
+	HTTPS_ENABLED=false
+	HTTPS_PORT=8443
+	HTTPS_LISTEN_ADDR=[::]
+	HTTPS_CERT_FILE=
+	HTTPS_KEY_FILE=
+
+	# Optional virtual host restriction (comma-separated).
+	# If empty and HTTPS is enabled, domains are auto-detected from certificate.
+	LISTEN_DOMAINS=
+
 # WebSocket configuration
 WS_ENABLED=true
 
@@ -88,6 +102,7 @@ TCP_PORT=9001
 TCP_LISTEN_ADDR=[::]
 TCP_KEY=%s
 TCP_WHITELIST_IPS=0.0.0.0/0,::/0
+TCP_TIMEOUT=30
 
 # Authentication for private arrays
 ADMIN_USERNAME=admin
@@ -115,11 +130,21 @@ func EnsureEnvFile(path string) error {
 
 	defaultEnv := fmt.Sprintf(`HTTP_PORT=8888
 
+	# HTTP and HTTPS server configuration
+	HTTP_ENABLED=true
+	HTTP_LISTEN_ADDR=0.0.0.0
+
+	HTTPS_ENABLED=false
+	HTTPS_PORT=8443
+	HTTPS_LISTEN_ADDR=0.0.0.0
+	HTTPS_CERT_FILE=
+	HTTPS_KEY_FILE=
+	LISTEN_DOMAINS=
+
 # Cluster configuration
 CLUSTER_PEERS=localhost:8889,localhost:8890
 CLUSTER_PORT=9000
 CLUSTER_LISTEN_ADDR=[::1]
-HTTP_LISTEN_ADDR=0.0.0.0
 
 # IP Whitelisting (comma-separated, default allows all: ::, 0.0.0.0)
 # Leave empty to allow all IPs
@@ -133,8 +158,6 @@ CLUSTER_CIPHER_KEY=%s
 CLUSTER_PEER_SECRET=%s
 
 # HTTP server configuration
-HTTP_ENABLED=true
-
 # WebSocket configuration
 WS_ENABLED=true
 
@@ -143,6 +166,7 @@ TCP_ENABLED=true
 TCP_PORT=9001
 TCP_LISTEN_ADDR=0.0.0.0
 TCP_KEY=%s
+TCP_TIMEOUT=30
 `, cipherKey, peerSecret, tcpKey)
 
 	if err := os.WriteFile(path, []byte(defaultEnv), 0600); err != nil {
@@ -151,6 +175,113 @@ TCP_KEY=%s
 
 	log.Printf("Created default .env file at %s with generated keys", path)
 	return nil
+}
+
+func envBool(value string, defaultValue bool) bool {
+	v := strings.ToLower(strings.TrimSpace(value))
+	if v == "" {
+		return defaultValue
+	}
+	return v == "true" || v == "1" || v == "yes" || v == "on"
+}
+
+func normalizeDomain(d string) string {
+	d = strings.ToLower(strings.TrimSpace(d))
+	d = strings.TrimPrefix(d, "[")
+	d = strings.TrimSuffix(d, "]")
+	return d
+}
+
+func parseDomainList(value string) []string {
+	parts := strings.Split(value, ",")
+	result := make([]string, 0, len(parts))
+	seen := make(map[string]struct{})
+	for _, p := range parts {
+		d := normalizeDomain(p)
+		if d == "" {
+			continue
+		}
+		if _, ok := seen[d]; ok {
+			continue
+		}
+		seen[d] = struct{}{}
+		result = append(result, d)
+	}
+	return result
+}
+
+func parseDomainsFromCertificate(certFilePath string) ([]string, error) {
+	certPEM, err := os.ReadFile(certFilePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read certificate file: %w", err)
+	}
+
+	var cert *x509.Certificate
+	for len(certPEM) > 0 {
+		var block *pem.Block
+		block, certPEM = pem.Decode(certPEM)
+		if block == nil {
+			break
+		}
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+
+		parsed, parseErr := x509.ParseCertificate(block.Bytes)
+		if parseErr != nil {
+			continue
+		}
+		cert = parsed
+		break
+	}
+
+	if cert == nil {
+		return nil, fmt.Errorf("no valid certificate found in %s", certFilePath)
+	}
+
+	domains := make([]string, 0, len(cert.DNSNames)+len(cert.IPAddresses)+1)
+	domains = append(domains, cert.DNSNames...)
+	for _, ip := range cert.IPAddresses {
+		domains = append(domains, ip.String())
+	}
+	if cert.Subject.CommonName != "" {
+		domains = append(domains, cert.Subject.CommonName)
+	}
+
+	unique := make([]string, 0, len(domains))
+	seen := make(map[string]struct{})
+	for _, d := range domains {
+		n := normalizeDomain(d)
+		if n == "" {
+			continue
+		}
+		if _, ok := seen[n]; ok {
+			continue
+		}
+		seen[n] = struct{}{}
+		unique = append(unique, n)
+	}
+
+	return unique, nil
+}
+
+func extractHostFromRequestHost(hostport string) string {
+	h := strings.TrimSpace(hostport)
+	if h == "" {
+		return ""
+	}
+
+	if strings.HasPrefix(h, "[") {
+		if end := strings.Index(h, "]"); end > 1 {
+			return strings.ToLower(h[1:end])
+		}
+	}
+
+	if host, _, err := net.SplitHostPort(h); err == nil {
+		return normalizeDomain(host)
+	}
+
+	return normalizeDomain(h)
 }
 
 func StartHTTPServer(loadLastConfig bool) error {
@@ -174,12 +305,18 @@ func StartHTTPServer(loadLastConfig bool) error {
 		return fmt.Errorf("failed to create runtime directory: %v", err)
 	}
 
-	port := os.Getenv("HTTP_PORT")
-	if port == "" {
-		port = env["HTTP_PORT"]
+	httpEnabled := envBool(env["HTTP_ENABLED"], true)
+	httpsEnabled := envBool(env["HTTPS_ENABLED"], false)
+	if !httpEnabled && !httpsEnabled {
+		return fmt.Errorf("both HTTP and HTTPS are disabled")
 	}
-	if port == "" {
-		port = "8888"
+
+	httpPort := os.Getenv("HTTP_PORT")
+	if httpPort == "" {
+		httpPort = env["HTTP_PORT"]
+	}
+	if httpPort == "" {
+		httpPort = "8888"
 	}
 
 	httpListenAddr := env["HTTP_LISTEN_ADDR"]
@@ -187,7 +324,45 @@ func StartHTTPServer(loadLastConfig bool) error {
 		httpListenAddr = "[::]"
 	}
 
-	addr := fmt.Sprintf("%s:%s", httpListenAddr, port)
+	httpsPort := env["HTTPS_PORT"]
+	if httpsPort == "" {
+		httpsPort = "8443"
+	}
+
+	httpsListenAddr := env["HTTPS_LISTEN_ADDR"]
+	if httpsListenAddr == "" {
+		httpsListenAddr = "[::]"
+	}
+
+	httpsCertFile := strings.TrimSpace(env["HTTPS_CERT_FILE"])
+	httpsKeyFile := strings.TrimSpace(env["HTTPS_KEY_FILE"])
+	if httpsEnabled {
+		if httpsCertFile == "" || httpsKeyFile == "" {
+			return fmt.Errorf("HTTPS_ENABLED=true requires HTTPS_CERT_FILE and HTTPS_KEY_FILE")
+		}
+	}
+
+	allowedDomains := parseDomainList(env["LISTEN_DOMAINS"])
+	if httpsEnabled && len(allowedDomains) == 0 {
+		certDomains, err := parseDomainsFromCertificate(httpsCertFile)
+		if err != nil {
+			return fmt.Errorf("failed to parse certificate domains: %w", err)
+		}
+		allowedDomains = certDomains
+		if len(allowedDomains) > 0 {
+			log.Printf("[HTTP] LISTEN_DOMAINS auto-detected from certificate: %s", strings.Join(allowedDomains, ","))
+		}
+	}
+
+	allowedDomainSet := make(map[string]struct{}, len(allowedDomains))
+	for _, d := range allowedDomains {
+		allowedDomainSet[d] = struct{}{}
+	}
+	enforceHostHeader := len(allowedDomainSet) > 0
+	if enforceHostHeader {
+		log.Printf("[HTTP] Virtual host filtering enabled for domains: %s", strings.Join(allowedDomains, ","))
+	}
+
 	mux := http.NewServeMux()
 
 	// Simple authentication check helper - returns true if valid credentials provided
@@ -203,6 +378,15 @@ func StartHTTPServer(loadLastConfig bool) error {
 	// IP whitelist check middleware wrapper
 	ipCheckMiddleware := func(handler http.HandlerFunc) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
+			if enforceHostHeader {
+				host := extractHostFromRequestHost(r.Host)
+				if _, ok := allowedDomainSet[host]; !ok {
+					http.Error(w, "Host not allowed", http.StatusForbidden)
+					log.Printf("[HTTP] Rejected request for disallowed host: %s (remote: %s)", r.Host, r.RemoteAddr)
+					return
+				}
+			}
+
 			if !GetClusterInstance().isIPAllowed(r.RemoteAddr, GetClusterInstance().httpWhitelist) {
 				http.Error(w, "Access denied: IP not whitelisted", http.StatusForbidden)
 				log.Printf("[HTTP] Rejected request from %s: IP not whitelisted", r.RemoteAddr)
@@ -424,16 +608,48 @@ func StartHTTPServer(loadLastConfig bool) error {
 		json.NewEncoder(w).Encode(map[string]string{"status": "success"})
 	}))
 
-	server := &http.Server{
-		Addr:              addr,
-		Handler:           mux,
-		ReadHeaderTimeout: 2 * time.Second,
-		ReadTimeout:       5 * time.Second,
-		WriteTimeout:      10 * time.Second,
-		IdleTimeout:       60 * time.Second,
-		MaxHeaderBytes:    1 << 20, // 1 MB
+	makeServer := func(addr string) *http.Server {
+		return &http.Server{
+			Addr:              addr,
+			Handler:           mux,
+			ReadHeaderTimeout: 2 * time.Second,
+			ReadTimeout:       5 * time.Second,
+			WriteTimeout:      10 * time.Second,
+			IdleTimeout:       60 * time.Second,
+			MaxHeaderBytes:    1 << 20, // 1 MB
+		}
 	}
 
-	log.Printf("Starting HTTP server on %s", addr)
-	return server.ListenAndServe()
+	errCh := make(chan error, 2)
+	started := 0
+
+	if httpEnabled {
+		started++
+		httpAddr := fmt.Sprintf("%s:%s", httpListenAddr, httpPort)
+		httpServer := makeServer(httpAddr)
+		go func() {
+			log.Printf("Starting HTTP server on %s", httpAddr)
+			if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				errCh <- fmt.Errorf("http listen failed: %w", err)
+			}
+		}()
+	}
+
+	if httpsEnabled {
+		started++
+		httpsAddr := fmt.Sprintf("%s:%s", httpsListenAddr, httpsPort)
+		httpsServer := makeServer(httpsAddr)
+		go func() {
+			log.Printf("Starting HTTPS server on %s (cert: %s)", httpsAddr, httpsCertFile)
+			if err := httpsServer.ListenAndServeTLS(httpsCertFile, httpsKeyFile); err != nil && err != http.ErrServerClosed {
+				errCh <- fmt.Errorf("https listen failed: %w", err)
+			}
+		}()
+	}
+
+	if started == 0 {
+		return fmt.Errorf("no HTTP/HTTPS listener started")
+	}
+
+	return <-errCh
 }

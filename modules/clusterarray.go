@@ -51,6 +51,7 @@ type Cluster struct {
 	tcpPort          string
 	tcpListenAddr    string
 	tcpKey           string
+	TcpEnabled       bool
 	WsEnabled        bool
 	HttpEnabled      bool
 	bootupTime       time.Time                         // Time when this cluster node started
@@ -85,6 +86,7 @@ func init() {
 		peerBootupTimes: make(map[string]time.Time),
 		wsSubscriptions: make(map[string][]chan WebSocketUpdate),
 		tcpTimeout:      30 * time.Second, // Default 30 second timeout
+		TcpEnabled:      true,
 	}
 
 	// Start background broadcast worker
@@ -197,6 +199,15 @@ func InitClusterArray(env map[string]string, loadLastConfig bool) {
 		clusterArray.tcpKey = tcpKey
 	}
 
+	// Parse TCP enabled flag (default: true)
+	clusterArray.TcpEnabled = true
+	if tcpEnabled, ok := env["TCP_ENABLED"]; ok {
+		tcpEnabled = strings.ToLower(strings.TrimSpace(tcpEnabled))
+		if tcpEnabled == "false" || tcpEnabled == "0" || tcpEnabled == "no" || tcpEnabled == "off" {
+			clusterArray.TcpEnabled = false
+		}
+	}
+
 	// Parse TCP whitelist IPs
 	if tcpWhitelist, ok := env["TCP_WHITELIST_IPS"]; ok && tcpWhitelist != "" {
 		for _, ip := range strings.Split(tcpWhitelist, ",") {
@@ -238,9 +249,11 @@ func InitClusterArray(env map[string]string, loadLastConfig bool) {
 		clusterArray.HttpEnabled = false
 	}
 
-	// Start TCP server if configured
-	if clusterArray.tcpKey != "" {
+	// Start TCP server if configured and enabled
+	if clusterArray.TcpEnabled && clusterArray.tcpKey != "" {
 		go clusterArray.StartTCPServer(clusterArray.tcpPort, clusterArray.tcpListenAddr, clusterArray.tcpKey)
+	} else if clusterArray.TcpEnabled && clusterArray.tcpKey == "" {
+		log.Printf("[TCP] TCP enabled but TCP_KEY is empty; TCP server not started")
 	}
 
 	// Load from last config if requested
@@ -1725,14 +1738,6 @@ func (c *Cluster) UnsubscribeFromArray(arrayName string, updateChan chan WebSock
 
 // BroadcastArrayUpdate sends an update to all subscribers of an array
 func (c *Cluster) BroadcastArrayUpdate(arrayName string) {
-	c.wsSubMu.RLock()
-	subscribers, ok := c.wsSubscriptions[arrayName]
-	c.wsSubMu.RUnlock()
-
-	if !ok || len(subscribers) == 0 {
-		return // No subscribers for this array
-	}
-
 	c.mu.RLock()
 	data := make(map[string]string)
 	if arr, exists := c.data[arrayName]; exists {
@@ -1749,8 +1754,17 @@ func (c *Cluster) BroadcastArrayUpdate(arrayName string) {
 		Timestamp: ts,
 	}
 
+	c.wsSubMu.RLock()
+	arraySubscribers := c.wsSubscriptions[arrayName]
+	allSubscribers := c.wsSubscriptions[""] // subscribers watching all arrays
+
+	if len(arraySubscribers) == 0 && len(allSubscribers) == 0 {
+		c.wsSubMu.RUnlock()
+		return
+	}
+
 	// Send update to all subscribers (non-blocking)
-	for _, ch := range subscribers {
+	for _, ch := range arraySubscribers {
 		select {
 		case ch <- update:
 			// Sent successfully
@@ -1759,4 +1773,18 @@ func (c *Cluster) BroadcastArrayUpdate(arrayName string) {
 			log.Printf("[WS] Dropped update for subscriber (channel full)\n")
 		}
 	}
+
+	if arrayName != "" {
+		for _, ch := range allSubscribers {
+			select {
+			case ch <- update:
+				// Sent successfully
+			default:
+				// Channel full, skip to avoid blocking
+				log.Printf("[WS] Dropped update for subscriber (channel full)\n")
+			}
+		}
+	}
+
+	c.wsSubMu.RUnlock()
 }

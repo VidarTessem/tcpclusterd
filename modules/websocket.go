@@ -10,6 +10,12 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+const (
+	wsReadTimeout  = 70 * time.Second
+	wsWriteTimeout = 10 * time.Second
+	wsPingInterval = 25 * time.Second
+)
+
 var wsUpgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
@@ -47,8 +53,12 @@ func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
+	conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+	conn.SetPongHandler(func(string) error {
+		conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
+		return nil
+	})
 
 	if usePolling {
 		// Legacy polling mode
@@ -66,14 +76,21 @@ func handleWebSocketEvents(conn *websocket.Conn, arrayName string) {
 	defer unsubscribe()
 
 	// Send initial data
-	sendWSData(conn, arrayName)
+	if err := sendWSData(conn, arrayName); err != nil {
+		log.Printf("[WS] Initial send error: %v\n", err)
+		IncrementErrorCount()
+		return
+	}
+
+	pingTicker := time.NewTicker(wsPingInterval)
+	defer pingTicker.Stop()
 
 	// Read control messages or wait for updates
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		for {
-			conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+			conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
 			_, _, err := conn.ReadMessage()
 			if err != nil {
 				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
@@ -91,10 +108,17 @@ func handleWebSocketEvents(conn *websocket.Conn, arrayName string) {
 			if !ok {
 				return // Channel closed
 			}
-			conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
 			if err := conn.WriteJSON(update); err != nil {
 				log.Printf("[WS] Send error: %v\n", err)
 				IncrementErrorCount()
+				return
+			}
+
+		case <-pingTicker.C:
+			conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				log.Printf("[WS] Ping error: %v\n", err)
 				return
 			}
 
@@ -108,23 +132,22 @@ func handleWebSocketEvents(conn *websocket.Conn, arrayName string) {
 func handleWebSocketPolling(conn *websocket.Conn, arrayName string, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	pingTicker := time.NewTicker(wsPingInterval)
+	defer pingTicker.Stop()
 
 	// Send initial data
-	sendWSData(conn, arrayName)
+	if err := sendWSData(conn, arrayName); err != nil {
+		log.Printf("[WS] Initial send error: %v\n", err)
+		IncrementErrorCount()
+		return
+	}
 
-	for {
-		select {
-		case <-ticker.C:
-			conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			if err := sendWSData(conn, arrayName); err != nil {
-				log.Printf("[WS] Send error: %v\n", err)
-				IncrementErrorCount()
-				return
-			}
-
-		default:
-			// Read control messages (pings, closes, etc)
-			conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	// Read control messages in background so periodic sends are not blocked
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
 			_, _, err := conn.ReadMessage()
 			if err != nil {
 				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
@@ -132,6 +155,28 @@ func handleWebSocketPolling(conn *websocket.Conn, arrayName string, interval tim
 				}
 				return
 			}
+		}
+	}()
+
+	for {
+		select {
+		case <-ticker.C:
+			conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+			if err := sendWSData(conn, arrayName); err != nil {
+				log.Printf("[WS] Send error: %v\n", err)
+				IncrementErrorCount()
+				return
+			}
+
+		case <-pingTicker.C:
+			conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				log.Printf("[WS] Ping error: %v\n", err)
+				return
+			}
+
+		case <-done:
+			return
 		}
 	}
 }

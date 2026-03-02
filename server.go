@@ -4,9 +4,18 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 
 	"cluster/modules"
 )
+
+func parseEnvBool(value string, defaultValue bool) bool {
+	v := strings.ToLower(strings.TrimSpace(value))
+	if v == "" {
+		return defaultValue
+	}
+	return v == "true" || v == "1" || v == "yes" || v == "on"
+}
 
 func main() {
 	// Check for --init or init flag first (before other checks)
@@ -95,14 +104,21 @@ func main() {
 	// Load environment and initialize cluster
 	env := modules.LoadEnvFile(".env")
 	modules.InitClusterArray(env, loadLastConfig)
+	httpsEnabled := parseEnvBool(env["HTTPS_ENABLED"], false)
+	tcpEnabled := parseEnvBool(env["TCP_ENABLED"], true)
+	httpEnabled := modules.GetClusterInstance().HttpEnabled
 
-	// Start HTTP server if enabled (it will create runtime directory)
-	if modules.GetClusterInstance().HttpEnabled {
+	if !httpEnabled && !httpsEnabled && !tcpEnabled {
+		log.Fatalf("startup aborted: HTTP, HTTPS, and TCP are all disabled")
+	}
+
+	// Start HTTP/HTTPS server if at least one is enabled (it will create runtime directory)
+	if httpEnabled || httpsEnabled {
 		if err := modules.StartHTTPServer(loadLastConfig); err != nil {
 			log.Fatalf("server failed: %v", err)
 		}
 	} else {
-		log.Printf("HTTP server disabled in configuration")
+		log.Printf("HTTP and HTTPS servers disabled; running with remaining protocols")
 		// Create runtime directory even if HTTP is disabled
 		if err := modules.GetClusterInstance().CreateRuntimeDirectory(); err != nil {
 			log.Fatalf("failed to create runtime directory: %v", err)
