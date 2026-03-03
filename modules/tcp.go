@@ -166,8 +166,8 @@ func (c *Cluster) handleTCPGet(writer *bufio.Writer, parts []string, authLevel i
 			// Return only private arrays with metrics
 			allData := c.GetAllWithMetricsAndPrivate()
 			data = map[string]interface{}{
-				"private_arrays": allData["private_arrays"],
-				"metrics":        allData["metrics"],
+				"private": allData["private"],
+				"metrics": allData["metrics"],
 			}
 		} else {
 			// Get specific array by name

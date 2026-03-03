@@ -2,12 +2,14 @@ package modules
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -15,6 +17,13 @@ import (
 	"strings"
 	"time"
 )
+
+// encodeJSON encodes data to JSON without HTML escaping
+func encodeJSON(w http.ResponseWriter, data interface{}) error {
+	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(false)
+	return enc.Encode(data)
+}
 
 // LoadEnvFile loads environment variables from a file
 func LoadEnvFile(path string) map[string]string {
@@ -90,6 +99,10 @@ WS_ENABLED=true
 LOG_ENABLED=false
 LOG_PATH=system.log
 
+# Local control socket (used for internal CLI -> running server commands)
+# No protocol-level auth; relies on local filesystem permissions.
+CONTROL_SOCKET=/tmp/tcpclusterd.sock
+
 # Cluster configuration
 CLUSTER_PORT=9000
 CLUSTER_LISTEN_ADDR=[::]
@@ -164,6 +177,10 @@ CLUSTER_PEER_SECRET=%s
 # HTTP server configuration
 # WebSocket configuration
 WS_ENABLED=true
+
+# Local control socket (used for internal CLI -> running server commands)
+# No protocol-level auth; relies on local filesystem permissions.
+CONTROL_SOCKET=/tmp/tcpclusterd.sock
 
 # TCP protocol configuration (direct cluster communication)
 TCP_ENABLED=true
@@ -312,6 +329,14 @@ func StartHTTPServer(loadLastConfig bool) error {
 	// Create runtime directory for HTTP server
 	if err := GetClusterInstance().CreateRuntimeDirectory(); err != nil {
 		return fmt.Errorf("failed to create runtime directory: %v", err)
+	}
+
+	// If startup requested recovery, persist the recovered in-memory snapshot
+	// into the newly created current runtime directory.
+	if loadLastConfig {
+		if err := GetClusterInstance().PersistCurrentRuntimeSnapshot(); err != nil {
+			return fmt.Errorf("failed to persist recovered snapshot: %v", err)
+		}
 	}
 
 	httpEnabled := envBool(env["HTTP_ENABLED"], true)
@@ -467,15 +492,15 @@ func StartHTTPServer(loadLastConfig bool) error {
 		if arrayName == "" {
 			// Return all arrays with metrics
 			if isAuthenticated {
-				json.NewEncoder(w).Encode(GetAllWithMetricsAndPrivate())
+				encodeJSON(w, GetAllWithMetricsAndPrivate())
 			} else {
-				json.NewEncoder(w).Encode(GetAllWithMetrics())
+				encodeJSON(w, GetAllWithMetrics())
 			}
 			return
 		}
 
 		// Return specific array (public only for now, could be extended)
-		json.NewEncoder(w).Encode(GetArray(arrayName))
+		encodeJSON(w, GetArray(arrayName))
 	}
 
 	mux.HandleFunc("/", ipCheckReadMiddleware(func(w http.ResponseWriter, r *http.Request) {
@@ -509,7 +534,7 @@ func StartHTTPServer(loadLastConfig bool) error {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "success"})
+		encodeJSON(w, map[string]string{"status": "success"})
 	}))
 
 	// Test endpoint: GET /cluster/read?array=<name>&key=<key>
@@ -529,7 +554,7 @@ func StartHTTPServer(loadLastConfig bool) error {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"value": value})
+		encodeJSON(w, map[string]string{"value": value})
 	}))
 
 	// Test endpoint: GET /cluster/all - returns all arrays with metrics
@@ -566,7 +591,7 @@ func StartHTTPServer(loadLastConfig bool) error {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "success"})
+		encodeJSON(w, map[string]string{"status": "success"})
 	}))
 
 	// GET /cluster/private/read?array=<name>&key=<key>
@@ -592,7 +617,7 @@ func StartHTTPServer(loadLastConfig bool) error {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"value": value})
+		encodeJSON(w, map[string]string{"value": value})
 	}))
 
 	// DELETE /cluster/private/delete?array=<name>&key=<key>
@@ -631,13 +656,207 @@ func StartHTTPServer(loadLastConfig bool) error {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "success"})
+		encodeJSON(w, map[string]string{"status": "success"})
+	}))
+
+	// POST endpoint: POST /cluster/import (import arrays from request body JSON)
+	mux.HandleFunc("/cluster/import", ipCheckWriteMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		if !checkPublicWriteAuth(r) {
+			http.Error(w, "Invalid or missing HTTP_KEY", http.StatusUnauthorized)
+			return
+		}
+
+		// Read JSON from request body
+		decoder := json.NewDecoder(r.Body)
+		var importData map[string]interface{}
+		if err := decoder.Decode(&importData); err != nil {
+			http.Error(w, fmt.Sprintf("Invalid JSON: %v", err), http.StatusBadRequest)
+			return
+		}
+
+		// Check for --clear query parameter
+		clearFirst := r.URL.Query().Get("clear") == "true"
+
+		// Use the cluster's Import method with a mock stdin
+		// For now, we'll implement inline import logic here
+		clusterArray := GetClusterInstance()
+		clusterArray.mu.Lock()
+
+		arraysToPersist := make([]string, 0)
+		if clearFirst {
+			for arrayName := range clusterArray.data {
+				arraysToPersist = append(arraysToPersist, arrayName)
+			}
+			clusterArray.data = make(map[string]map[string]string)
+			clusterArray.privateData = make(map[string]map[string]string)
+			clusterArray.timestamps = make(map[string]time.Time)
+		}
+
+		// Extract data from importData
+		var dataMap map[string]map[string]string
+		if publicRaw, ok := importData["public"]; ok {
+			publicMap, _ := publicRaw.(map[string]interface{})
+			dataMap = clusterArray.convertInterfaceToStringMap(publicMap)
+		} else if arrays, ok := importData["arrays"]; ok {
+			arraysMap, _ := arrays.(map[string]interface{})
+			dataMap = clusterArray.convertInterfaceToStringMap(arraysMap)
+		}
+
+		if dataMap != nil {
+			for arrayName, arrayData := range dataMap {
+				clusterArray.data[arrayName] = arrayData
+				arraysToPersist = append(arraysToPersist, arrayName)
+			}
+		}
+
+		clusterArray.mu.Unlock()
+
+		// Persist changes
+		for _, arrayName := range arraysToPersist {
+			if err := clusterArray.saveArrayToDisk(arrayName); err != nil {
+				http.Error(w, fmt.Sprintf("Failed to persist array: %v", err), http.StatusInternalServerError)
+				return
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		encodeJSON(w, map[string]string{"status": "imported"})
+	}))
+
+	// POST endpoint: POST /cluster/importfile (import JSON file into array)
+	mux.HandleFunc("/cluster/importfile", ipCheckWriteMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		if !checkPublicWriteAuth(r) {
+			http.Error(w, "Invalid or missing HTTP_KEY", http.StatusUnauthorized)
+			return
+		}
+
+		arraySpec := r.URL.Query().Get("array")
+		if arraySpec == "" {
+			http.Error(w, "Missing array parameter", http.StatusBadRequest)
+			return
+		}
+
+		// Read JSON from request body
+		jsonBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Failed to read body: %v", err), http.StatusBadRequest)
+			return
+		}
+
+		// Validate JSON
+		if !json.Valid(jsonBytes) {
+			http.Error(w, "Request body is not valid JSON", http.StatusBadRequest)
+			return
+		}
+
+		// Use ImportFileToArray-like logic but with the body data
+		arrayName := strings.TrimSpace(arraySpec)
+		isPrivate := false
+		upper := strings.ToUpper(arrayName)
+		switch {
+		case strings.HasPrefix(upper, "PRIVATE:"):
+			isPrivate = true
+			arrayName = strings.TrimSpace(arrayName[len("PRIVATE:"):])
+		case strings.HasPrefix(upper, "PUBLIC:"):
+			isPrivate = false
+			arrayName = strings.TrimSpace(arrayName[len("PUBLIC:"):])
+		default:
+			http.Error(w, "array parameter must start with PUBLIC: or PRIVATE:", http.StatusBadRequest)
+			return
+		}
+
+		if arrayName == "" {
+			http.Error(w, "array name is empty", http.StatusBadRequest)
+			return
+		}
+
+		if strings.Contains(arrayName, ":") {
+			http.Error(w, fmt.Sprintf("invalid array name '%s': ':' is not allowed", arrayName), http.StatusBadRequest)
+			return
+		}
+
+		// Compact JSON
+		var compact bytes.Buffer
+		if err := json.Compact(&compact, jsonBytes); err != nil {
+			http.Error(w, fmt.Sprintf("Failed to compact JSON: %v", err), http.StatusBadRequest)
+			return
+		}
+
+		jsonValue := compact.String()
+
+		// Store in cluster
+		clusterArray := GetClusterInstance()
+		clusterArray.mu.Lock()
+		if isPrivate {
+			if clusterArray.privateData[arrayName] == nil {
+				clusterArray.privateData[arrayName] = make(map[string]string)
+			}
+			clusterArray.privateData[arrayName]["json"] = jsonValue
+		} else {
+			if clusterArray.data[arrayName] == nil {
+				clusterArray.data[arrayName] = make(map[string]string)
+			}
+			clusterArray.data[arrayName]["json"] = jsonValue
+		}
+		clusterArray.timestamps[arrayName] = time.Now()
+		clusterArray.mu.Unlock()
+
+		// Persist to disk
+		if isPrivate {
+			if err := clusterArray.savePrivateArrayToDisk(arrayName); err != nil {
+				http.Error(w, fmt.Sprintf("Failed to persist: %v", err), http.StatusInternalServerError)
+				return
+			}
+		} else {
+			if err := clusterArray.saveArrayToDisk(arrayName); err != nil {
+				http.Error(w, fmt.Sprintf("Failed to persist: %v", err), http.StatusInternalServerError)
+				return
+			}
+		}
+
+		// Broadcast update
+		clusterArray.BroadcastArrayUpdate(arrayName)
+		clusterArray.broadcastToPeers()
+
+		w.Header().Set("Content-Type", "application/json")
+		encodeJSON(w, map[string]string{"status": "imported"})
 	}))
 
 	// WebSocket endpoint for real-time array updates
 	if GetClusterInstance().WsEnabled {
 		mux.HandleFunc("/ws", ipCheckReadMiddleware(HandleWebSocket))
 	}
+
+	// POST endpoint: POST /cluster/reload (reloads from disk)
+	mux.HandleFunc("/cluster/reload", ipCheckWriteMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		if !checkPublicWriteAuth(r) {
+			http.Error(w, "Invalid or missing HTTP_KEY", http.StatusUnauthorized)
+			return
+		}
+
+		if err := ReloadFromDisk(); err != nil {
+			http.Error(w, fmt.Sprintf("Failed to reload: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		encodeJSON(w, map[string]string{"status": "reloaded"})
+	}))
 
 	// DELETE endpoint: DELETE /cluster/delete?array=<name>&key=<key>
 	mux.HandleFunc("/cluster/delete", ipCheckWriteMiddleware(func(w http.ResponseWriter, r *http.Request) {
@@ -674,7 +893,7 @@ func StartHTTPServer(loadLastConfig bool) error {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "success"})
+		encodeJSON(w, map[string]string{"status": "success"})
 	}))
 
 	makeServer := func(addr string) *http.Server {

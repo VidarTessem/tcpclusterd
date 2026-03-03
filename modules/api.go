@@ -108,3 +108,29 @@ func ExportArray(arrayName string) error {
 func Import(clearFirst bool) error {
 	return clusterArray.Import(clearFirst)
 }
+
+// ImportFromBytes imports arrays from a JSON payload.
+func ImportFromBytes(payload []byte, clearFirst bool) error {
+	return clusterArray.ImportFromBytes(payload, clearFirst)
+}
+
+// ImportFileToArray imports one JSON file into a single array entry.
+// Use targetArray with prefix "PRIVATE:" to store into private arrays.
+func ImportFileToArray(targetArray, filePath string) error {
+	return clusterArray.ImportFileToArray(targetArray, filePath)
+}
+
+// ImportJSONToArray imports a JSON payload into one array entry.
+func ImportJSONToArray(targetArray string, payload []byte) error {
+	return clusterArray.ImportJSONToArray(targetArray, payload)
+}
+
+// ReloadFromDisk reloads all arrays from the current runtime directory
+func ReloadFromDisk() error {
+	return clusterArray.ReloadFromDisk()
+}
+
+// RecoverFromDisk recovers from the latest suitable runtime snapshot.
+func RecoverFromDisk() error {
+	return clusterArray.RecoverFromDisk()
+}

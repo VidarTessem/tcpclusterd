@@ -2,6 +2,7 @@ package modules
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -27,9 +28,9 @@ const (
 
 // WebSocketUpdate represents an update pushed to WebSocket clients
 type WebSocketUpdate struct {
-	ArrayName string            `json:"array_name"`
-	Data      map[string]string `json:"data"`
-	Timestamp time.Time         `json:"timestamp"`
+	ArrayName string                 `json:"array_name"`
+	Data      map[string]interface{} `json:"data"`
+	Timestamp time.Time              `json:"timestamp"`
 }
 
 // Cluster represents a distributed cluster array instance
@@ -182,6 +183,36 @@ func (c *Cluster) detectNodeID() string {
 	return "node-unknown"
 }
 
+// isLocalPeer checks if a peer address is the local node
+func (c *Cluster) isLocalPeer(peerAddr string) bool {
+	localCandidates := map[string]struct{}{}
+
+	// Include explicit listen address when it is a concrete IP.
+	if n := normalizeNodeAddr(c.listenAddr); n != "" && n != "::" && n != "0.0.0.0" {
+		localCandidates[n] = struct{}{}
+	}
+
+	// Include all interface IPs.
+	if addrs, err := net.InterfaceAddrs(); err == nil {
+		for _, a := range addrs {
+			switch v := a.(type) {
+			case *net.IPNet:
+				if v.IP != nil {
+					localCandidates[v.IP.String()] = struct{}{}
+				}
+			case *net.IPAddr:
+				if v.IP != nil {
+					localCandidates[v.IP.String()] = struct{}{}
+				}
+			}
+		}
+	}
+
+	normalizedPeer := normalizeNodeAddr(peerAddr)
+	_, isLocal := localCandidates[normalizedPeer]
+	return isLocal
+}
+
 // CreateRuntimeDirectory creates a new runtime directory with current timestamp
 func (c *Cluster) CreateRuntimeDirectory() error {
 	timestamp := time.Now().Format("2006-01-02_15-04-05")
@@ -194,6 +225,23 @@ func (c *Cluster) CreateRuntimeDirectory() error {
 	c.runtimePath = runtimePath
 	log.Printf("[CLUSTER:%s] Runtime directory: %s\n", c.getNodeID(), runtimePath)
 	return nil
+}
+
+// EnsureRuntimeDirectory ensures there is an active runtime path.
+// It tries to reuse the latest runtime directory first; if none exists, it creates a new one.
+func (c *Cluster) EnsureRuntimeDirectory() error {
+	c.mu.RLock()
+	hasRuntime := c.runtimePath != ""
+	c.mu.RUnlock()
+	if hasRuntime {
+		return nil
+	}
+
+	if err := c.loadFromLastConfig(); err == nil {
+		return nil
+	}
+
+	return c.CreateRuntimeDirectory()
 }
 
 // InitClusterArray initializes the cluster from environment variables
@@ -358,6 +406,33 @@ func InitClusterArray(env map[string]string, loadLastConfig bool) {
 		clusterArray.ClusterHideIP = true
 	}
 
+	// CLI/maintenance mode: initialize data layer only, skip all network listeners.
+	noListen := false
+	if v, ok := env["NO_LISTEN"]; ok {
+		v = strings.ToLower(strings.TrimSpace(v))
+		if v == "true" || v == "1" || v == "yes" || v == "on" {
+			noListen = true
+		}
+	}
+	if v, ok := env["CLUSTER_NO_LISTEN"]; ok {
+		v = strings.ToLower(strings.TrimSpace(v))
+		if v == "true" || v == "1" || v == "yes" || v == "on" {
+			noListen = true
+		}
+	}
+
+	if noListen {
+		// Load from last config if requested, but do not bind any sockets.
+		if loadLastConfig {
+			if err := clusterArray.loadFromLastConfig(); err != nil {
+				log.Printf("[CLUSTER:%s] Error loading last config: %v\n", clusterArray.getNodeID(), err)
+				IncrementErrorCount()
+			}
+		}
+		log.Printf("[CLUSTER:%s] NO_LISTEN enabled: skipping TCP and peer sync listeners\n", clusterArray.getNodeID())
+		return
+	}
+
 	// Start TCP server if configured and enabled
 	if clusterArray.TcpEnabled && clusterArray.tcpKey != "" {
 		go clusterArray.StartTCPServer(clusterArray.tcpPort, clusterArray.tcpListenAddr, clusterArray.tcpKey)
@@ -391,13 +466,49 @@ func (c *Cluster) loadFromLastConfig() error {
 		return fmt.Errorf("failed to read runtime directory: %v", err)
 	}
 
-	// Find the most recent directory (alphabetically last due to timestamp format)
+	// Prefer newest runtime directory that contains JSON array files.
+	// If the newest directory is empty/corrupt, fall back to the previous one.
+	currentRuntime := filepath.Clean(c.runtimePath)
 	var latestDir string
+	var fallbackLatestDir string
 	for i := len(entries) - 1; i >= 0; i-- {
-		if entries[i].IsDir() {
-			latestDir = entries[i].Name()
+		if !entries[i].IsDir() {
+			continue
+		}
+
+		dirName := entries[i].Name()
+		dirPath := filepath.Clean(filepath.Join("runtime", dirName))
+
+		if fallbackLatestDir == "" {
+			fallbackLatestDir = dirName
+		}
+
+		// Skip the current runtime if it is already set.
+		if currentRuntime != "." && currentRuntime != "" && dirPath == currentRuntime {
+			continue
+		}
+
+		files, err := os.ReadDir(dirPath)
+		if err != nil {
+			continue
+		}
+
+		hasJSON := false
+		for _, f := range files {
+			if !f.IsDir() && strings.HasSuffix(f.Name(), ".json") {
+				hasJSON = true
+				break
+			}
+		}
+
+		if hasJSON {
+			latestDir = dirName
 			break
 		}
+	}
+
+	if latestDir == "" {
+		latestDir = fallbackLatestDir
 	}
 
 	if latestDir == "" {
@@ -408,6 +519,13 @@ func (c *Cluster) loadFromLastConfig() error {
 	c.runtimePath = latestPath
 	// log.Printf("[CLUSTER:%s] Loading from last config: %s\n", c.getNodeID(), latestPath)
 
+	// Replace in-memory state with recovered snapshot.
+	c.mu.Lock()
+	c.data = make(map[string]map[string]string)
+	c.privateData = make(map[string]map[string]string)
+	c.timestamps = make(map[string]time.Time)
+	c.mu.Unlock()
+
 	// Read all JSON files from the directory
 	files, err := os.ReadDir(latestPath)
 	if err != nil {
@@ -417,15 +535,14 @@ func (c *Cluster) loadFromLastConfig() error {
 	loadedCount := 0
 	loadedPrivateCount := 0
 	for _, file := range files {
-		if file.IsDir() || !strings.HasSuffix(file.Name(), ".json") {
+		if file.IsDir() {
 			continue
 		}
 
 		fileName := file.Name()
-		isPrivate := strings.HasPrefix(fileName, "private_")
-		arrayName := strings.TrimSuffix(fileName, ".json")
-		if isPrivate {
-			arrayName = strings.TrimPrefix(arrayName, "private_")
+		arrayName, isPrivate, ok := decodeRuntimeArrayFile(fileName)
+		if !ok {
+			continue
 		}
 		filePath := filepath.Join(latestPath, fileName)
 
@@ -462,6 +579,167 @@ func (c *Cluster) loadFromLastConfig() error {
 	}
 
 	log.Printf("[CLUSTER:%s] Loaded %d public arrays and %d private arrays from %s\n", c.getNodeID(), loadedCount, loadedPrivateCount, latestPath)
+	return nil
+}
+
+// ReloadFromDisk reloads all arrays from the current runtime directory
+func (c *Cluster) ReloadFromDisk() error {
+	c.mu.RLock()
+	runtimePath := c.runtimePath
+	c.mu.RUnlock()
+
+	if runtimePath == "" {
+		return fmt.Errorf("no runtime directory set")
+	}
+
+	// Read all JSON files from the directory
+	files, err := os.ReadDir(runtimePath)
+	if err != nil {
+		return fmt.Errorf("failed to read runtime directory: %v", err)
+	}
+
+	loadedCount := 0
+	loadedPrivateCount := 0
+	for _, file := range files {
+		if file.IsDir() {
+			continue
+		}
+
+		fileName := file.Name()
+		arrayName, isPrivate, ok := decodeRuntimeArrayFile(fileName)
+		if !ok {
+			continue
+		}
+		filePath := filepath.Join(runtimePath, fileName)
+
+		// Read and parse JSON file
+		data, err := os.ReadFile(filePath)
+		if err != nil {
+			log.Printf("[CLUSTER:%s] Error reading file %s: %v\n", c.getNodeID(), filePath, err)
+			continue
+		}
+
+		var payload struct {
+			Data      map[string]string `json:"data"`
+			Timestamp time.Time         `json:"timestamp"`
+		}
+
+		if err := json.Unmarshal(data, &payload); err != nil {
+			log.Printf("[CLUSTER:%s] Error unmarshaling file %s: %v\n", c.getNodeID(), filePath, err)
+			continue
+		}
+
+		// Load into cluster array
+		c.mu.Lock()
+		if isPrivate {
+			c.privateData[arrayName] = payload.Data
+			loadedPrivateCount++
+		} else {
+			c.data[arrayName] = payload.Data
+			loadedCount++
+		}
+		c.timestamps[arrayName] = payload.Timestamp
+		c.mu.Unlock()
+	}
+
+	log.Printf("[CLUSTER:%s] Reloaded %d public arrays and %d private arrays from %s\n", c.getNodeID(), loadedCount, loadedPrivateCount, runtimePath)
+
+	// Broadcast updates to WebSocket clients for all loaded arrays
+	c.mu.RLock()
+	for arrayName := range c.data {
+		c.BroadcastArrayUpdate(arrayName)
+	}
+	c.mu.RUnlock()
+
+	return nil
+}
+
+// RecoverFromDisk loads the latest suitable runtime snapshot (typically previous runtime)
+// and broadcasts updates.
+func (c *Cluster) RecoverFromDisk() error {
+	c.mu.RLock()
+	currentRuntime := c.runtimePath
+	c.mu.RUnlock()
+
+	if err := c.loadFromLastConfig(); err != nil {
+		return err
+	}
+
+	// Keep current runtime as write target and persist recovered snapshot into it.
+	if strings.TrimSpace(currentRuntime) != "" {
+		c.mu.Lock()
+		c.runtimePath = currentRuntime
+		c.mu.Unlock()
+
+		if err := c.PersistCurrentRuntimeSnapshot(); err != nil {
+			return err
+		}
+	}
+
+	// Broadcast updates to websocket subscribers after recovery.
+	c.mu.RLock()
+	arrayNames := make([]string, 0, len(c.data))
+	for arrayName := range c.data {
+		arrayNames = append(arrayNames, arrayName)
+	}
+	c.mu.RUnlock()
+
+	for _, arrayName := range arrayNames {
+		c.BroadcastArrayUpdate(arrayName)
+	}
+
+	return nil
+}
+
+// PersistCurrentRuntimeSnapshot writes the full in-memory state to the current runtime directory.
+// Existing json files in the runtime directory are removed first, so disk matches memory.
+func (c *Cluster) PersistCurrentRuntimeSnapshot() error {
+	c.mu.RLock()
+	runtimePath := c.runtimePath
+	publicNames := make([]string, 0, len(c.data))
+	for name := range c.data {
+		publicNames = append(publicNames, name)
+	}
+	privateNames := make([]string, 0, len(c.privateData))
+	for name := range c.privateData {
+		privateNames = append(privateNames, name)
+	}
+	c.mu.RUnlock()
+
+	if strings.TrimSpace(runtimePath) == "" {
+		return fmt.Errorf("runtime path is not initialized")
+	}
+
+	if err := os.MkdirAll(runtimePath, 0755); err != nil {
+		return fmt.Errorf("failed to create runtime directory: %v", err)
+	}
+
+	entries, err := os.ReadDir(runtimePath)
+	if err != nil {
+		return fmt.Errorf("failed to read runtime directory: %v", err)
+	}
+
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		if err := os.Remove(filepath.Join(runtimePath, e.Name())); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("failed cleaning runtime file %s: %v", e.Name(), err)
+		}
+	}
+
+	for _, name := range publicNames {
+		if err := c.saveArrayToDisk(name); err != nil {
+			return err
+		}
+	}
+	for _, name := range privateNames {
+		if err := c.savePrivateArrayToDisk(name); err != nil {
+			return err
+		}
+	}
+
+	log.Printf("[CLUSTER:%s] Persisted snapshot to %s (%d public, %d private)", c.getNodeID(), runtimePath, len(publicNames), len(privateNames))
 	return nil
 }
 
@@ -584,10 +862,15 @@ func (c *Cluster) saveArrayToDisk(arrayName string) error {
 		"timestamp": timestamp,
 	}
 
-	filePath := filepath.Join(c.runtimePath, arrayName+".json")
+	filePath := filepath.Join(c.runtimePath, "public_"+arrayName+".json")
 	jsonData, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("failed to marshal array: %v", err)
+	}
+
+	// Ensure directory exists, recreate if necessary
+	if err := os.MkdirAll(c.runtimePath, 0755); err != nil {
+		return fmt.Errorf("failed to create runtime directory: %v", err)
 	}
 
 	if err := os.WriteFile(filePath, jsonData, 0644); err != nil {
@@ -599,9 +882,16 @@ func (c *Cluster) saveArrayToDisk(arrayName string) error {
 
 // deleteArrayFromDisk deletes an array's JSON file
 func (c *Cluster) deleteArrayFromDisk(arrayName string) error {
-	filePath := filepath.Join(c.runtimePath, arrayName+".json")
+	// Remove current format first.
+	filePath := filepath.Join(c.runtimePath, "public_"+arrayName+".json")
 	if err := os.Remove(filePath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("failed to delete file: %v", err)
+	}
+
+	// Backward-compat cleanup for legacy unprefixed files.
+	legacyPath := filepath.Join(c.runtimePath, arrayName+".json")
+	if err := os.Remove(legacyPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to delete legacy file: %v", err)
 	}
 	return nil
 }
@@ -638,6 +928,11 @@ func (c *Cluster) savePrivateArrayToDisk(arrayName string) error {
 		return fmt.Errorf("failed to marshal private array: %v", err)
 	}
 
+	// Ensure directory exists, recreate if necessary
+	if err := os.MkdirAll(c.runtimePath, 0755); err != nil {
+		return fmt.Errorf("failed to create runtime directory: %v", err)
+	}
+
 	if err := os.WriteFile(filePath, jsonData, 0600); err != nil {
 		return fmt.Errorf("failed to write private file: %v", err)
 	}
@@ -652,6 +947,32 @@ func (c *Cluster) deletePrivateArrayFromDisk(arrayName string) error {
 		return fmt.Errorf("failed to delete private file: %v", err)
 	}
 	return nil
+}
+
+// decodeRuntimeArrayFile maps persisted runtime filenames to array names/types.
+// Preferred format:
+//
+//	public_<array>.json
+//	private_<array>.json
+//
+// Legacy format (backward-compat):
+//
+//	<array>.json  (treated as public)
+func decodeRuntimeArrayFile(fileName string) (arrayName string, isPrivate bool, ok bool) {
+	if !strings.HasSuffix(fileName, ".json") {
+		return "", false, false
+	}
+
+	base := strings.TrimSuffix(fileName, ".json")
+	switch {
+	case strings.HasPrefix(base, "private_"):
+		return strings.TrimPrefix(base, "private_"), true, true
+	case strings.HasPrefix(base, "public_"):
+		return strings.TrimPrefix(base, "public_"), false, true
+	default:
+		// Legacy unprefixed public array file.
+		return base, false, true
+	}
 }
 
 // encryptMessage encrypts plaintext using AES-256-GCM
@@ -1058,6 +1379,18 @@ func (c *Cluster) GetMetrics() map[string]interface{} {
 		}
 		normalizedPeer := normalizeNodeAddr(peer)
 
+		// If this is our own peer entry, use our bootup time and mark as online
+		if c.isLocalPeer(peer) {
+			peerDetails[displayName] = map[string]string{
+				"node_id":        strconv.Itoa(i + 1),
+				"bootup_time":    c.bootupTime.Format(time.RFC3339),
+				"current_status": "online",
+				"last_seen":      currentTime,
+				"current_time":   currentTime,
+			}
+			continue
+		}
+
 		bootup := ""
 		if bootTime, ok := c.peerBootupTimes[peer]; ok {
 			bootup = bootTime.Format(time.RFC3339)
@@ -1095,7 +1428,14 @@ func (c *Cluster) GetMetrics() map[string]interface{} {
 		health = "disabled"
 	} else {
 		responsivePeers := 0
+		externalPeers := 0
 		for _, peer := range c.peers {
+			// Skip ourselves in health calculation
+			if c.isLocalPeer(peer) {
+				continue
+			}
+			externalPeers++
+
 			normalizedPeer := normalizeNodeAddr(peer)
 			seenAt, ok := c.peerLastSeen[peer]
 			if !ok {
@@ -1105,7 +1445,11 @@ func (c *Cluster) GetMetrics() map[string]interface{} {
 				responsivePeers++
 			}
 		}
-		if responsivePeers == peerCount {
+
+		// If no external peers, we're standalone - that's healthy
+		if externalPeers == 0 {
+			health = "healthy"
+		} else if responsivePeers == externalPeers {
 			health = "healthy"
 		} else if responsivePeers > 0 {
 			health = "degraded"
@@ -1132,7 +1476,7 @@ func (c *Cluster) GetMetrics() map[string]interface{} {
 // GetAllWithMetrics returns arrays and metrics together
 func (c *Cluster) GetAllWithMetrics() map[string]interface{} {
 	return map[string]interface{}{
-		"arrays":  c.GetAll(),
+		"public":  c.GetAllParsed(),
 		"metrics": c.GetMetrics(),
 	}
 }
@@ -1140,10 +1484,70 @@ func (c *Cluster) GetAllWithMetrics() map[string]interface{} {
 // GetAllWithMetricsAndPrivate returns both public and private arrays with metrics
 func (c *Cluster) GetAllWithMetricsAndPrivate() map[string]interface{} {
 	return map[string]interface{}{
-		"arrays":         c.GetAll(),
-		"private_arrays": c.GetAllPrivate(),
-		"metrics":        c.GetMetrics(),
+		"public":  c.GetAllParsed(),
+		"private": c.GetAllPrivateParsed(),
+		"metrics": c.GetMetrics(),
 	}
+}
+
+// GetAllParsed returns all public arrays with "json" keys parsed to objects
+func (c *Cluster) GetAllParsed() map[string]interface{} {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	result := make(map[string]interface{})
+	for arrayName, array := range c.data {
+		result[arrayName] = c.parseArrayValues(array)
+	}
+	return result
+}
+
+// GetAllPrivateParsed returns all private arrays with "json" keys parsed to objects
+func (c *Cluster) GetAllPrivateParsed() map[string]interface{} {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	result := make(map[string]interface{})
+	for arrayName, array := range c.privateData {
+		result[arrayName] = c.parseArrayValues(array)
+	}
+	return result
+}
+
+// parseArrayValues converts string values to parsed JSON objects where appropriate
+// If the array contains only a "json" key with a valid JSON object, returns that object directly
+func (c *Cluster) parseArrayValues(array map[string]string) map[string]interface{} {
+	// Special case: if array only has "json" key with parsed object, return it directly
+	if len(array) == 1 {
+		if jsonValue, hasJSON := array["json"]; hasJSON && json.Valid([]byte(jsonValue)) {
+			var parsed interface{}
+			if err := json.Unmarshal([]byte(jsonValue), &parsed); err == nil {
+				// Return the parsed object directly instead of wrapping it
+				if objMap, ok := parsed.(map[string]interface{}); ok {
+					return objMap
+				}
+				// If it's not an object, still wrap it
+				return map[string]interface{}{"json": parsed}
+			}
+		}
+	}
+
+	// Normal case: return key:value pairs with "json" values parsed
+	result := make(map[string]interface{})
+	for k, v := range array {
+		// If key is "json" and value is valid JSON, parse it
+		if k == "json" && json.Valid([]byte(v)) {
+			var parsed interface{}
+			if err := json.Unmarshal([]byte(v), &parsed); err == nil {
+				result[k] = parsed
+			} else {
+				result[k] = v // fallback to string if parse fails
+			}
+		} else {
+			result[k] = v
+		}
+	}
+	return result
 }
 
 // GetAll returns all public arrays
@@ -1496,6 +1900,10 @@ func (c *Cluster) peerHeartbeatLoop() {
 
 	for range ticker.C {
 		for _, peer := range c.peers {
+			// Skip pinging ourselves
+			if c.isLocalPeer(peer) {
+				continue
+			}
 			c.pingPeer(peer)
 		}
 	}
@@ -1791,6 +2199,7 @@ func (c *Cluster) Export() error {
 
 	encoder := json.NewEncoder(os.Stdout)
 	encoder.SetIndent("", "  ")
+	encoder.SetEscapeHTML(false)
 	if err := encoder.Encode(exportData); err != nil {
 		return fmt.Errorf("failed to export: %v", err)
 	}
@@ -1805,6 +2214,7 @@ func (c *Cluster) ExportArray(arrayName string) error {
 
 	encoder := json.NewEncoder(os.Stdout)
 	encoder.SetIndent("", "  ")
+	encoder.SetEscapeHTML(false)
 	if err := encoder.Encode(exportData); err != nil {
 		return fmt.Errorf("failed to export array: %v", err)
 	}
@@ -1814,14 +2224,24 @@ func (c *Cluster) ExportArray(arrayName string) error {
 
 // Import imports arrays from stdin (JSON format - supports public and private arrays)
 func (c *Cluster) Import(clearFirst bool) error {
-	// Read JSON from stdin - use generic map to support multiple formats
 	var importData map[string]interface{}
-
 	decoder := json.NewDecoder(os.Stdin)
 	if err := decoder.Decode(&importData); err != nil {
 		return fmt.Errorf("failed to decode import data: %v", err)
 	}
+	return c.importFromMap(importData, clearFirst)
+}
 
+// ImportFromBytes imports arrays from a JSON byte payload.
+func (c *Cluster) ImportFromBytes(payload []byte, clearFirst bool) error {
+	var importData map[string]interface{}
+	if err := json.Unmarshal(payload, &importData); err != nil {
+		return fmt.Errorf("failed to decode import payload: %v", err)
+	}
+	return c.importFromMap(importData, clearFirst)
+}
+
+func (c *Cluster) importFromMap(importData map[string]interface{}, clearFirst bool) error {
 	c.mu.Lock()
 
 	arraysToPersist := make([]string, 0)
@@ -1831,7 +2251,6 @@ func (c *Cluster) Import(clearFirst bool) error {
 
 	// Clear existing data if requested
 	if clearFirst {
-		// Track existing arrays for disk cleanup
 		for arrayName := range c.data {
 			arraysToDelete = append(arraysToDelete, arrayName)
 		}
@@ -1845,24 +2264,27 @@ func (c *Cluster) Import(clearFirst bool) error {
 		log.Printf("[CLUSTER:%s] Cleared all existing arrays before import\n", clusterArray.getNodeID())
 	}
 
-	// Determine format and extract data/timestamps
 	var dataMap map[string]map[string]string
 	var privateDataMap map[string]map[string]string
 	var timestampsMap map[string]time.Time
 
-	// Check if new format (with "arrays" and "metrics" keys)
-	if arrays, ok := importData["arrays"]; ok {
-		// New format: {"arrays": {...}, "private_arrays": {...}, "metrics": {...}}
+	if publicRaw, ok := importData["public"]; ok {
+		publicMap, _ := publicRaw.(map[string]interface{})
+		dataMap = c.convertInterfaceToStringMap(publicMap)
+
+		if privateRaw, ok := importData["private"]; ok {
+			privateMap, _ := privateRaw.(map[string]interface{})
+			privateDataMap = c.convertInterfaceToStringMap(privateMap)
+		}
+	} else if arrays, ok := importData["arrays"]; ok {
 		arraysMap, _ := arrays.(map[string]interface{})
 		dataMap = c.convertInterfaceToStringMap(arraysMap)
 
-		// Import private arrays if present
 		if privateArrays, ok := importData["private_arrays"]; ok {
 			privateArraysMap, _ := privateArrays.(map[string]interface{})
 			privateDataMap = c.convertInterfaceToStringMap(privateArraysMap)
 		}
 	} else if data, ok := importData["data"]; ok {
-		// Old format: {"data": {...}, "timestamps": {...}}
 		if dataObj, ok := data.(map[string]interface{}); ok {
 			dataMap = c.convertInterfaceToStringMap(dataObj)
 		}
@@ -1882,10 +2304,9 @@ func (c *Cluster) Import(clearFirst bool) error {
 
 	if dataMap == nil {
 		c.mu.Unlock()
-		return fmt.Errorf("invalid import format: missing 'arrays' or 'data' key")
+		return fmt.Errorf("invalid import format: missing 'public'/'arrays' or 'data' key")
 	}
 
-	// Import data
 	for arrayName, array := range dataMap {
 		if c.data[arrayName] == nil {
 			c.data[arrayName] = make(map[string]string)
@@ -1895,7 +2316,6 @@ func (c *Cluster) Import(clearFirst bool) error {
 			c.data[arrayName][k] = v
 		}
 
-		// Set timestamp if available
 		if ts, ok := timestampsMap[arrayName]; ok {
 			c.timestamps[arrayName] = ts
 		} else {
@@ -1905,7 +2325,6 @@ func (c *Cluster) Import(clearFirst bool) error {
 		arraysToPersist = append(arraysToPersist, arrayName)
 	}
 
-	// Import private data
 	for arrayName, array := range privateDataMap {
 		if c.privateData[arrayName] == nil {
 			c.privateData[arrayName] = make(map[string]string)
@@ -1915,7 +2334,6 @@ func (c *Cluster) Import(clearFirst bool) error {
 			c.privateData[arrayName][k] = v
 		}
 
-		// Set timestamp if available
 		if ts, ok := timestampsMap[arrayName]; ok {
 			c.timestamps[arrayName] = ts
 		} else {
@@ -1933,7 +2351,6 @@ func (c *Cluster) Import(clearFirst bool) error {
 	for _, arrayName := range privateArraysToDelete {
 		c.queueDeletePrivate(arrayName)
 	}
-
 	for _, arrayName := range arraysToPersist {
 		c.queueSave(arrayName)
 	}
@@ -1951,14 +2368,133 @@ func (c *Cluster) convertInterfaceToStringMap(data map[string]interface{}) map[s
 	for key, val := range data {
 		if innerMap, ok := val.(map[string]interface{}); ok {
 			result[key] = make(map[string]string)
-			for k, v := range innerMap {
-				if str, ok := v.(string); ok {
-					result[key][k] = str
+			allStringValues := true
+			for _, v := range innerMap {
+				if _, ok := v.(string); !ok {
+					allStringValues = false
+					break
 				}
+			}
+
+			if allStringValues {
+				for k, v := range innerMap {
+					result[key][k] = v.(string)
+				}
+				continue
+			}
+
+			// Complex object payload (e.g. imported DSL JSON) is preserved under key "json".
+			if raw, err := json.Marshal(innerMap); err == nil {
+				result[key]["json"] = string(raw)
 			}
 		}
 	}
 	return result
+}
+
+// ImportJSONToArray imports a JSON payload into a single array entry.
+func (c *Cluster) ImportJSONToArray(targetArray string, jsonBytes []byte) error {
+	if !json.Valid(jsonBytes) {
+		return fmt.Errorf("payload is not valid JSON")
+	}
+
+	tmp, err := os.CreateTemp("", "cluster_import_*.json")
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %v", err)
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+
+	if _, err := tmp.Write(jsonBytes); err != nil {
+		tmp.Close()
+		return fmt.Errorf("failed to write temp file: %v", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("failed to close temp file: %v", err)
+	}
+
+	return c.ImportFileToArray(targetArray, tmpPath)
+}
+
+// ImportFileToArray imports one JSON file into a single entry in an array.
+// Prefix targetArray with "PRIVATE:" to store it in private arrays.
+// The JSON content is stored under key "json".
+func (c *Cluster) ImportFileToArray(targetArray, filePath string) error {
+	arrayName := strings.TrimSpace(targetArray)
+	if arrayName == "" {
+		return fmt.Errorf("target array is required")
+	}
+
+	jsonBytes, err := os.ReadFile(filePath)
+	if err != nil {
+		return fmt.Errorf("failed reading file '%s': %v", filePath, err)
+	}
+
+	if !json.Valid(jsonBytes) {
+		return fmt.Errorf("file '%s' is not valid JSON", filePath)
+	}
+
+	// Store compact JSON to avoid multiline parsing issues in key:value payload format.
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, jsonBytes); err != nil {
+		return fmt.Errorf("failed compacting JSON from '%s': %v", filePath, err)
+	}
+
+	jsonValue := compact.String()
+
+	isPrivate := false
+	upper := strings.ToUpper(arrayName)
+	switch {
+	case strings.HasPrefix(upper, "PRIVATE:"):
+		isPrivate = true
+		arrayName = strings.TrimSpace(arrayName[len("PRIVATE:"):])
+	case strings.HasPrefix(upper, "PUBLIC:"):
+		isPrivate = false
+		arrayName = strings.TrimSpace(arrayName[len("PUBLIC:"):])
+	default:
+		return fmt.Errorf("target array must start with PUBLIC: or PRIVATE:")
+	}
+
+	if arrayName == "" {
+		return fmt.Errorf("target array name is empty")
+	}
+	if strings.Contains(arrayName, ":") {
+		return fmt.Errorf("invalid array name '%s': ':' is not allowed in array names", arrayName)
+	}
+
+	// Write synchronously so command-style usage persists before process exits.
+	c.mu.Lock()
+	if isPrivate {
+		if c.privateData[arrayName] == nil {
+			c.privateData[arrayName] = make(map[string]string)
+		}
+		c.privateData[arrayName]["json"] = jsonValue
+	} else {
+		if c.data[arrayName] == nil {
+			c.data[arrayName] = make(map[string]string)
+		}
+		c.data[arrayName]["json"] = jsonValue
+	}
+	c.timestamps[arrayName] = time.Now()
+	c.mu.Unlock()
+
+	if isPrivate {
+		if err := c.savePrivateArrayToDisk(arrayName); err != nil {
+			return err
+		}
+		log.Printf("[CLUSTER:%s] Imported JSON file '%s' into private array '%s' (key=json)", c.getNodeID(), filePath, arrayName)
+	} else {
+		if err := c.saveArrayToDisk(arrayName); err != nil {
+			return err
+		}
+		log.Printf("[CLUSTER:%s] Imported JSON file '%s' into public array '%s' (key=json)", c.getNodeID(), filePath, arrayName)
+	}
+
+	// Keep cluster behavior consistent with regular writes.
+	c.BroadcastArrayUpdate(arrayName)
+	c.broadcastToPeers()
+
+	return nil
 }
 
 // SubscribeToArray subscribes a channel to receive updates for a specific array
@@ -2037,9 +2573,12 @@ func (c *Cluster) BroadcastArrayUpdate(arrayName string) {
 	ts := c.timestamps[arrayName]
 	c.mu.RUnlock()
 
+	// Parse JSON values for WebSocket transmission
+	parsedData := c.parseArrayValues(data)
+
 	update := WebSocketUpdate{
 		ArrayName: arrayName,
-		Data:      data,
+		Data:      parsedData,
 		Timestamp: ts,
 	}
 
