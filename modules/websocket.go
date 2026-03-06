@@ -1,196 +1,512 @@
 package modules
 
 import (
+	"fmt"
 	"log"
 	"net/http"
-	"strconv"
-	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
 
-const (
-	wsReadTimeout  = 70 * time.Second
-	wsWriteTimeout = 10 * time.Second
-	wsPingInterval = 25 * time.Second
-)
-
-var wsUpgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
-	CheckOrigin: func(r *http.Request) bool {
-		// Allow all origins for now; in production, be more restrictive
-		return true
-	},
+// WebSocketMessage represents a message sent to WebSocket clients
+type WebSocketMessage struct {
+	Type      string                 `json:"type"` // "data", "heartbeat", "token", "error"
+	Data      map[string]interface{} `json:"data,omitempty"`
+	Token     string                 `json:"token,omitempty"`
+	Timestamp int64                  `json:"timestamp"`
+	Database  string                 `json:"database,omitempty"`
+	Query     string                 `json:"query,omitempty"`
 }
 
-// HandleWebSocket handles WebSocket connections
-// Query params: ?array=<name>&interval=<ms>
-// If array is specified, subscribes to that array's updates
-// If interval is NOT specified, uses event-based push (immediate updates)
-// If interval IS specified, polls at that interval (legacy mode)
-func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
-	conn, err := wsUpgrader.Upgrade(w, r, nil)
+// WebSocketRequest represents a request from WebSocket client
+type WebSocketRequest struct {
+	Type     string `json:"type"`     // "subscribe", "query", "auth"
+	Database string `json:"database"` // Which database to monitor
+	Table    string `json:"table"`    // Which table to monitor (empty = all tables)
+	Query    string `json:"query"`    // SQL query for data
+	Token    string `json:"token"`    // Access token
+	Username string `json:"username"`
+	Mode     int    `json:"mode"`     // 1 = onChange, 2 = interval
+	Interval int    `json:"interval"` // Polling interval in seconds (for mode 2)
+}
+
+// WebSocketClient represents a connected WebSocket client
+type WebSocketClient struct {
+	ID              string
+	conn            *websocket.Conn
+	db              *Database
+	tokenManager    *TokenManager
+	mode            int // 1 = onChange, 2 = interval
+	intervalSec     int
+	database        string
+	table           string
+	query           string
+	token           string
+	user            *User
+	lastData        interface{}
+	send            chan *WebSocketMessage
+	done            chan bool
+	mu              sync.RWMutex
+	lastHeartbeat   time.Time
+	disconnectCount int
+}
+
+// WebSocketServer manages all WebSocket connections
+type WebSocketServer struct {
+	db           *Database
+	tokenManager *TokenManager
+	clients      map[string]*WebSocketClient
+	mu           sync.RWMutex
+	pingInterval time.Duration
+	maxReconnect int
+	upgrader     websocket.Upgrader
+}
+
+// NewWebSocketServer creates a new WebSocket server
+func NewWebSocketServer(db *Database, tokenManager *TokenManager, pingIntervalSec int) *WebSocketServer {
+	return &WebSocketServer{
+		db:           db,
+		tokenManager: tokenManager,
+		clients:      make(map[string]*WebSocketClient),
+		pingInterval: time.Duration(pingIntervalSec) * time.Second,
+		maxReconnect: 5,
+		upgrader: websocket.Upgrader{
+			CheckOrigin: func(r *http.Request) bool {
+				return true // Allow all origins for now
+			},
+		},
+	}
+}
+
+// HandleConnection upgrades HTTP connection to WebSocket
+func (ws *WebSocketServer) HandleConnection(w http.ResponseWriter, r *http.Request) {
+	conn, err := ws.upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("[WS] Upgrade error: %v\n", err)
-		IncrementErrorCount()
+		log.Printf("WebSocket upgrade error: %v", err)
 		return
 	}
-	defer conn.Close()
 
-	arrayName := strings.TrimSpace(r.URL.Query().Get("array"))
-	intervalStr := strings.TrimSpace(r.URL.Query().Get("interval"))
-
-	// Determine mode: event-based (default) or polling
-	usePolling := false
-	var interval time.Duration
-	if intervalStr != "" {
-		usePolling = true
-		interval = 1000 * time.Millisecond
-		if ms, err := strconv.ParseInt(intervalStr, 10, 64); err == nil && ms > 0 {
-			interval = time.Duration(ms) * time.Millisecond
-		}
+	client := &WebSocketClient{
+		ID:            fmt.Sprintf("ws-%d", time.Now().UnixNano()),
+		conn:          conn,
+		db:            ws.db,
+		tokenManager:  ws.tokenManager,
+		send:          make(chan *WebSocketMessage, 256),
+		done:          make(chan bool),
+		lastHeartbeat: time.Now(),
 	}
 
-	conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
-	conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
-	conn.SetPongHandler(func(string) error {
-		conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
+	ws.mu.Lock()
+	ws.clients[client.ID] = client
+	ws.mu.Unlock()
+
+	log.Printf("WebSocket client connected: %s", client.ID)
+
+	// Handle incoming messages (blocking)
+	go client.handleMessages()
+
+	// Handle sending messages
+	go client.handleSend()
+
+	// Handle keep-alive ping
+	go client.handleKeepAlive(ws.pingInterval)
+
+	// Wait for done signal from handleMessages
+	<-client.done
+
+	// Cleanup
+	conn.Close()
+	ws.mu.Lock()
+	delete(ws.clients, client.ID)
+	ws.mu.Unlock()
+
+	log.Printf("WebSocket client disconnected: %s", client.ID)
+}
+
+// handleMessages handles incoming messages from WebSocket client
+func (client *WebSocketClient) handleMessages() {
+	defer func() {
+		client.conn.Close()
+		client.done <- true
+	}()
+
+	// Don't set a global read deadline - use SetReadDeadline per message with pong handler
+	client.conn.SetPongHandler(func(string) error {
+		// Reset read deadline on pong
+		client.conn.SetReadDeadline(time.Now().Add(120 * time.Second))
+		client.mu.Lock()
+		client.lastHeartbeat = time.Now()
+		client.mu.Unlock()
 		return nil
 	})
 
-	if usePolling {
-		// Legacy polling mode
-		handleWebSocketPolling(conn, arrayName, interval)
-	} else {
-		// Event-based mode (default)
-		handleWebSocketEvents(conn, arrayName)
+	for {
+		// Set read deadline for each message (3 minutes to be generous)
+		client.conn.SetReadDeadline(time.Now().Add(3 * time.Minute))
+
+		var req WebSocketRequest
+		err := client.conn.ReadJSON(&req)
+		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				log.Printf("WebSocket error for client %s: %v", client.ID, err)
+			}
+			return
+		}
+
+		switch req.Type {
+		case "auth":
+			client.handleAuth(req)
+		case "subscribe":
+			client.handleSubscribe(req)
+		case "query":
+			client.handleQuery(req)
+		default:
+			client.sendError("Unknown request type: " + req.Type)
+		}
 	}
 }
 
-// handleWebSocketEvents uses event-based push (subscribes to updates)
-func handleWebSocketEvents(conn *websocket.Conn, arrayName string) {
-	// Subscribe to array updates
-	updateChan, unsubscribe := GetClusterInstance().SubscribeToArray(arrayName)
-	defer unsubscribe()
+// handleAuth authenticates the client and issues a new token
+func (client *WebSocketClient) handleAuth(req WebSocketRequest) {
+	// Validate token if provided
+	var username string
+	var isAdmin bool
+	var err error
 
-	// Send initial data
-	if err := sendWSData(conn, arrayName); err != nil {
-		log.Printf("[WS] Initial send error: %v\n", err)
-		IncrementErrorCount()
+	if req.Token != "" {
+		// Validate existing token
+		username, isAdmin, err = client.tokenManager.ValidateToken(req.Token)
+		if err != nil {
+			client.sendError("Invalid token: " + err.Error())
+			return
+		}
+		// Consume the provided token
+		client.tokenManager.ConsumeToken(req.Token)
+	} else {
+		client.sendError("No token provided")
 		return
 	}
 
-	pingTicker := time.NewTicker(wsPingInterval)
-	defer pingTicker.Stop()
+	// Issue new token for this connection
+	newToken, err := client.tokenManager.IssueToken(username, isAdmin)
+	if err != nil {
+		client.sendError("Failed to issue token: " + err.Error())
+		return
+	}
 
-	// Read control messages or wait for updates
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		for {
-			conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
-			_, _, err := conn.ReadMessage()
-			if err != nil {
-				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-					log.Printf("[WS] Connection error: %v\n", err)
-				}
-				return
-			}
+	// Store authenticated user and token
+	client.mu.Lock()
+	client.token = newToken
+	client.user = &User{
+		Username: username,
+		IsAdmin:  isAdmin,
+	}
+	client.mu.Unlock()
+
+	// Send new token to client
+	client.send <- &WebSocketMessage{
+		Type:      "token",
+		Token:     newToken,
+		Timestamp: time.Now().Unix(),
+	}
+
+	log.Printf("WebSocket client %s authenticated as %s", client.ID, username)
+}
+
+// handleSubscribe subscribes to database changes (optional authentication)
+func (client *WebSocketClient) handleSubscribe(req WebSocketRequest) {
+	// Authentication is optional:
+	// - Without auth: access only public data
+	// - With auth: access public + private (if user owns database)
+
+	// Ensure this is a SELECT query if provided (read-only)
+	if req.Query != "" && IsWriteOperation(req.Query) {
+		client.sendError("WebSocket does not support write operations. Use HTTP API instead.")
+		return
+	}
+
+	client.mu.Lock()
+	client.mode = req.Mode
+	client.database = req.Database
+	client.table = req.Table
+	client.query = req.Query
+	// Set default interval to 5 seconds if not provided
+	if req.Interval > 0 {
+		client.intervalSec = req.Interval
+	} else {
+		client.intervalSec = 5
+	}
+	client.mu.Unlock()
+
+	// Send initial data
+	client.sendInitialData()
+
+	// Start data watcher based on mode
+	if req.Mode == 1 {
+		// Mode 1: onChange - watch for database changes (TODO: implement change notification)
+		log.Printf("Client %s subscribed to %s in onChange mode", client.ID, req.Database)
+	} else if req.Mode == 2 {
+		// Mode 2: interval - send data at regular intervals
+		if client.user != nil {
+			log.Printf("Client %s subscribed to %s in interval mode (%ds) as %s", client.ID, req.Database, client.intervalSec, client.user.Username)
+		} else {
+			log.Printf("Client %s subscribed to %s in interval mode (%ds) (unauthenticated)", client.ID, req.Database, client.intervalSec)
 		}
-	}()
+		go client.handleIntervalMode()
+	}
+}
 
-	// Wait for updates or connection close
+// handleQuery executes a query and sends results (requires authentication)
+func (client *WebSocketClient) handleQuery(req WebSocketRequest) {
+	if client.user == nil {
+		client.sendError("Not authenticated. Send auth request first.")
+		return
+	}
+
+	// Ensure this is a SELECT query (read-only)
+	if IsWriteOperation(req.Query) {
+		client.sendError("WebSocket does not support write operations. Use HTTP API instead.")
+		return
+	}
+
+	// Execute query:
+	// - owner gets both public + private rows for the requested table
+	// - non-owner gets public rows only
+	isOwner := client.user.Username == req.Database
+	result, err := client.selectTableWithOwnership(req.Database, req.Query, isOwner)
+	if err != nil {
+		client.sendError(fmt.Sprintf("Query error: %v", err))
+		return
+	}
+
+	client.send <- &WebSocketMessage{
+		Type:      "data",
+		Data:      map[string]interface{}{"result": result},
+		Database:  req.Database,
+		Query:     req.Query,
+		Timestamp: time.Now().Unix(),
+	}
+}
+
+// selectTableWithOwnership returns rows for a specific table based on ownership.
+// Owners receive public + private rows; non-owners receive public rows only.
+func (client *WebSocketClient) selectTableWithOwnership(database, table string, isOwner bool) (interface{}, error) {
+	if !isOwner {
+		return client.db.SelectRows(database, table, make(map[string]string), false)
+	}
+
+	publicRowsRaw, err := client.db.SelectRows(database, table, make(map[string]string), false)
+	if err != nil {
+		return nil, err
+	}
+
+	privateRowsRaw, err := client.db.SelectRows(database, table, make(map[string]string), true)
+	if err != nil {
+		return nil, err
+	}
+
+	publicRows, _ := publicRowsRaw.([]interface{})
+	privateRows, _ := privateRowsRaw.([]interface{})
+
+	merged := make([]interface{}, 0, len(publicRows)+len(privateRows))
+	merged = append(merged, publicRows...)
+	merged = append(merged, privateRows...)
+
+	return merged, nil
+}
+
+// buildSubscriptionResult builds explicit public/private subscription payload.
+// For owners: {"public": {...}, "private": {...}}
+// For guests: {"public": {...}}
+func (client *WebSocketClient) buildSubscriptionResult(database, table string, isOwner bool) (interface{}, error) {
+	result := make(map[string]interface{})
+
+	if table != "" {
+		publicRowsRaw, err := client.db.SelectRows(database, table, make(map[string]string), false)
+		if err != nil {
+			return nil, err
+		}
+		publicRows, _ := publicRowsRaw.([]interface{})
+		result["public"] = map[string]interface{}{table: publicRows}
+
+		if isOwner {
+			privateRowsRaw, err := client.db.SelectRows(database, table, make(map[string]string), true)
+			if err != nil {
+				return nil, err
+			}
+			privateRows, _ := privateRowsRaw.([]interface{})
+			result["private"] = map[string]interface{}{table: privateRows}
+		}
+
+		return result, nil
+	}
+
+	publicTables, err := client.db.GetAllTables(database, false)
+	if err != nil {
+		return nil, err
+	}
+	result["public"] = publicTables
+
+	if isOwner {
+		privateTables, err := client.db.GetAllTables(database, true)
+		if err != nil {
+			return nil, err
+		}
+		result["private"] = privateTables
+	}
+
+	return result, nil
+}
+
+// sendInitialData sends the initial data to the client
+func (client *WebSocketClient) sendInitialData() {
+	client.mu.RLock()
+	database := client.database
+	table := client.table
+	var username string
+	var isOwner bool
+	if client.user != nil {
+		username = client.user.Username
+		isOwner = username == database
+	}
+	client.mu.RUnlock()
+
+	if database == "" {
+		return
+	}
+
+	// Get data based on authentication status
+	var result interface{}
+	var err error
+
+	result, err = client.buildSubscriptionResult(database, table, isOwner)
+
+	if err != nil {
+		client.sendError(fmt.Sprintf("Failed to get initial data: %v", err))
+		return
+	}
+
+	client.mu.Lock()
+	client.lastData = result
+	client.mu.Unlock()
+
+	client.send <- &WebSocketMessage{
+		Type:      "data",
+		Data:      map[string]interface{}{"result": result},
+		Database:  database,
+		Timestamp: time.Now().Unix(),
+	}
+}
+
+// handleIntervalMode sends data at regular intervals
+func (client *WebSocketClient) handleIntervalMode() {
+	client.mu.RLock()
+	interval := client.intervalSec
+	database := client.database
+	client.mu.RUnlock()
+
+	ticker := time.NewTicker(time.Duration(interval) * time.Second)
+	defer ticker.Stop()
+
 	for {
 		select {
-		case _, ok := <-updateChan:
-			if !ok {
-				return // Channel closed
+		case <-client.done:
+			return
+		case <-ticker.C:
+			// Check current auth state (may have changed since subscription started)
+			client.mu.RLock()
+			var isOwner bool
+			if client.user != nil {
+				isOwner = client.user.Username == database
 			}
-			if err := sendWSData(conn, arrayName); err != nil {
-				log.Printf("[WS] Send error: %v\n", err)
-				IncrementErrorCount()
-				return
+			currentDatabase := client.database
+			currentTable := client.table
+			client.mu.RUnlock()
+
+			// Fetch current data
+			var result interface{}
+			var err error
+
+			result, err = client.buildSubscriptionResult(currentDatabase, currentTable, isOwner)
+
+			if err != nil {
+				client.sendError(fmt.Sprintf("Interval query error: %v", err))
+				continue
 			}
 
-		case <-pingTicker.C:
-			conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
-			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-				log.Printf("[WS] Ping error: %v\n", err)
-				return
+			client.send <- &WebSocketMessage{
+				Type:      "data",
+				Data:      map[string]interface{}{"result": result},
+				Database:  currentDatabase,
+				Timestamp: time.Now().Unix(),
 			}
-
-		case <-done:
-			return // Connection closed
 		}
 	}
 }
 
-// handleWebSocketPolling uses polling mode (legacy, interval-based)
-func handleWebSocketPolling(conn *websocket.Conn, arrayName string, interval time.Duration) {
+// handleKeepAlive sends periodic ping messages
+func (client *WebSocketClient) handleKeepAlive(interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	pingTicker := time.NewTicker(wsPingInterval)
-	defer pingTicker.Stop()
-
-	// Send initial data
-	if err := sendWSData(conn, arrayName); err != nil {
-		log.Printf("[WS] Initial send error: %v\n", err)
-		IncrementErrorCount()
-		return
-	}
-
-	// Read control messages in background so periodic sends are not blocked
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		for {
-			conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
-			_, _, err := conn.ReadMessage()
-			if err != nil {
-				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-					log.Printf("[WS] Connection error: %v\n", err)
-				}
-				return
-			}
-		}
-	}()
 
 	for {
 		select {
+		case <-client.done:
+			return
 		case <-ticker.C:
-			conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
-			if err := sendWSData(conn, arrayName); err != nil {
-				log.Printf("[WS] Send error: %v\n", err)
-				IncrementErrorCount()
+			err := client.conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(5*time.Second))
+			if err != nil {
+				log.Printf("Ping error for client %s: %v", client.ID, err)
+				return
+			}
+		}
+	}
+}
+
+// handleSend handles outgoing messages
+func (client *WebSocketClient) handleSend() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case msg := <-client.send:
+			client.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if err := client.conn.WriteJSON(msg); err != nil {
+				log.Printf("Write error for client %s: %v", client.ID, err)
 				return
 			}
 
-		case <-pingTicker.C:
-			conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
-			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-				log.Printf("[WS] Ping error: %v\n", err)
+		case <-ticker.C:
+			// Send heartbeat every 30 seconds
+			client.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if err := client.conn.WriteJSON(&WebSocketMessage{
+				Type:      "heartbeat",
+				Timestamp: time.Now().Unix(),
+			}); err != nil {
+				log.Printf("Heartbeat error for client %s: %v", client.ID, err)
 				return
 			}
 
-		case <-done:
+		case <-client.done:
 			return
 		}
 	}
 }
 
-func sendWSData(conn *websocket.Conn, arrayName string) error {
-	var data interface{}
-
-	if arrayName == "" {
-		data = GetAllWithMetrics()
-	} else {
-		// When filtering by specific array, return just the array data (like HTTP endpoint)
-		data = GetArray(arrayName)
+// sendError sends an error message to the client
+func (client *WebSocketClient) sendError(errMsg string) {
+	client.send <- &WebSocketMessage{
+		Type:      "error",
+		Data:      map[string]interface{}{"message": errMsg},
+		Timestamp: time.Now().Unix(),
 	}
+}
 
-	conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
-
-	return conn.WriteJSON(data)
+// RegisterWebSocketHandler registers the WebSocket handler on the HTTP server
+func RegisterWebSocketHandler(ws *WebSocketServer) {
+	http.HandleFunc("/ws", ws.HandleConnection)
+	http.HandleFunc("/websocket", ws.HandleConnection)
 }
