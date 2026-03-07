@@ -19,6 +19,7 @@ TEST_IP_WHITELIST.sh
 *.a
 *.so
 *.dylib
+*.json
 
 # IDE
 .vscode/
