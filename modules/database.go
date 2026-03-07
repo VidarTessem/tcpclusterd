@@ -918,7 +918,7 @@ func (db *Database) GetAllDatabases() []string {
 
 // extractIPFromAddress extracts the IP address from a "host:port" or "[ipv6]:port" format
 func extractIPFromAddress(address string) string {
-	// Handle IPv6 with brackets: [2a03:94e0:205b:d:1::aaab]:5000
+	// Handle IPv6 with brackets: [fd00:250:250:d:1::aaab]:5000
 	if strings.HasPrefix(address, "[") {
 		if idx := strings.Index(address, "]"); idx > 0 {
 			return address[1:idx]

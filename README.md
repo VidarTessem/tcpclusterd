@@ -54,7 +54,7 @@ Create a `.env` file:
 CLUSTER_PEERS=""
 
 # Or Multi-Server Cluster
-CLUSTER_PEERS="[2a03:94e0:205b:d:1::aaaa]:5000,[2a03:94e0:205b:d:1::aaab]:5000"
+CLUSTER_PEERS="[fd00:250:250:d:1::aaaa]:5000,[fd00:250:250:d:1::aaab]:5000"
 
 # Other settings
 ADMIN_PASSWORD="your-secure-password"
@@ -119,7 +119,7 @@ All commands communicate with the running server via Unix socket. **The server m
 ./app --peer-metrics
 
 # Show metrics for specific peer
-./app --peer-metrics "[2a03:94e0:205b:d:1::aaaa]:5000"
+./app --peer-metrics "[fd00:250:250:d:1::aaaa]:5000"
 ```
 
 ### Runtime Management
@@ -383,7 +383,7 @@ Cluster node status and replication statistics (public).
 
 ```json
 {
-  "peer_address": "[2a03:94e0:205b:d:1::aaaa]:5000",
+  "peer_address": "[fd00:250:250:d:1::aaaa]:5000",
   "is_online": true,
   "last_ping": 1772824145,
   "replication_failures": 0,
@@ -503,15 +503,15 @@ curl -X POST http://localhost:9090/api/query \
 
 ### Multi-Server Setup
 
-**Node 1** (`[2a03:94e0:205b:d:1::aaaa]:5000`):
+**Node 1** (`[fd00:250:250:d:1::aaaa]:5000`):
 ```bash
-CLUSTER_PEERS="[2a03:94e0:205b:d:1::aaaa]:5000,[2a03:94e0:205b:d:1::aaab]:5000"
+CLUSTER_PEERS="[fd00:250:250:d:1::aaaa]:5000,[fd00:250:250:d:1::aaab]:5000"
 ./app
 ```
 
-**Node 2** (`[2a03:94e0:205b:d:1::aaab]:5000`):
+**Node 2** (`[fd00:250:250:d:1::aaab]:5000`):
 ```bash
-CLUSTER_PEERS="[2a03:94e0:205b:d:1::aaaa]:5000,[2a03:94e0:205b:d:1::aaab]:5000"
+CLUSTER_PEERS="[fd00:250:250:d:1::aaaa]:5000,[fd00:250:250:d:1::aaab]:5000"
 ./app
 ```
 

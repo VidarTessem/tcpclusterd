@@ -91,9 +91,9 @@ Node 3: 192.168.1.102:5000
 
 Or IPv6:
 ```
-Node 1: [2a03:94e0:205b:d:1::aaaa]:5000
-Node 2: [2a03:94e0:205b:d:1::aaab]:5000
-Node 3: [2a03:94e0:205b:d:1::aaac]:5000
+Node 1: [fd00:250:250:d:1::aaaa]:5000
+Node 2: [fd00:250:250:d:1::aaab]:5000
+Node 3: [fd00:250:250:d:1::aaac]:5000
 ```
 
 ### 2. Build on All Nodes
@@ -110,7 +110,7 @@ chmod +x app
 cp .env.example .env
 
 # Edit .env
-CLUSTER_PEERS="[2a03:94e0:205b:d:1::aaaa]:5000,[2a03:94e0:205b:d:1::aaab]:5000,[2a03:94e0:205b:d:1::aaac]:5000"
+CLUSTER_PEERS="[fd00:250:250:d:1::aaaa]:5000,[fd00:250:250:d:1::aaab]:5000,[fd00:250:250:d:1::aaac]:5000"
 CLUSTER_DEFAULT_PORT=5000
 ADMIN_PASSWORD=SecureAdminPassword123
 REPLICATION_TOKEN=SharedTokenFor3Nodes...
@@ -127,21 +127,21 @@ TOKEN_TTL_SECONDS=3600
 **Terminal on Node 1:**
 ```bash
 ./app
-# [INFO] Cluster node at [2a03:94e0:205b:d:1::aaaa]:5000
+# [INFO] Cluster node at [fd00:250:250:d:1::aaaa]:5000
 # [INFO] Peer server started for cluster communication
 ```
 
 **Terminal on Node 2:**
 ```bash
 ./app
-# [INFO] Cluster node at [2a03:94e0:205b:d:1::aaab]:5000
+# [INFO] Cluster node at [fd00:250:250:d:1::aaab]:5000
 # [INFO] Peer server started for cluster communication
 ```
 
 **Terminal on Node 3:**
 ```bash
 ./app
-# [INFO] Cluster node at [2a03:94e0:205b:d:1::aaac]:5000
+# [INFO] Cluster node at [fd00:250:250:d:1::aaac]:5000
 # [INFO] Peer server started for cluster communication
 ```
 
@@ -155,17 +155,17 @@ From any node:
 {
   "data": [
     {
-      "peer_address": "[2a03:94e0:205b:d:1::aaaa]:5000",
+      "peer_address": "[fd00:250:250:d:1::aaaa]:5000",
       "is_online": true,
       "last_ping": 1772824145
     },
     {
-      "peer_address": "[2a03:94e0:205b:d:1::aaab]:5000",
+      "peer_address": "[fd00:250:250:d:1::aaab]:5000",
       "is_online": true,
       "last_ping": 1772824142
     },
     {
-      "peer_address": "[2a03:94e0:205b:d:1::aaac]:5000",
+      "peer_address": "[fd00:250:250:d:1::aaac]:5000",
       "is_online": true,
       "last_ping": 1772824140
     }
