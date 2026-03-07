@@ -1,0 +1,315 @@
+[
+    {
+      "id": "inbound",
+      "type": "entry",
+      "next": "set_initial_balance",
+      "during": [
+        {
+          "id": "watch_low_balance_sms",
+          "type": "condition",
+          "expr": "call.remaining_seconds < 190 && flags.low_balance_initial_high == true && flags.low_balance_sms_sent != true",
+          "then": [
+            {
+              "action": "sms.send",
+              "params": {
+                "text": "Du har ca. {remaining_minutes} minutt(er) / {remaining_seconds} sekunder igjen på samtalen. Fyll på saldo for å fortsette.",
+                "to": "{caller.phone}",
+                "vars": {
+                  "remaining_minutes": "{call.remaining_seconds/60}",
+                  "remaining_seconds": "{call.remaining_seconds}"
+                }
+              },
+              "type": "action"
+            },
+            {
+              "type": "set",
+              "values": {
+                "flags.low_balance_sms_sent": true
+              }
+            }
+          ]
+        },
+        {
+          "id": "watch_zero_balance_hangup",
+          "type": "condition",
+          "expr": "call.remaining_seconds <= 0 && flags.in_agent_call == true",
+          "then": [
+            {
+              "text": "Saldoen din er brukt opp. Samtalen avsluttes nå.",
+              "type": "say"
+            },
+            {
+              "type": "hangup"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "set_initial_balance",
+      "type": "condition",
+      "next": "chk_agent_assigned",
+      "expr": "call.remaining_seconds > 190",
+      "then": [
+        {
+          "type": "set",
+          "values": {
+            "flags.low_balance_initial_high": true
+          }
+        }
+      ]
+    },
+    {
+      "id": "chk_agent_assigned",
+      "type": "condition",
+      "expr": "agent.id != null && agent.id != ''",
+      "then": "chk_agent_active",
+      "else": "menu_no_agent_assigned"
+    },
+    {
+      "id": "menu_no_agent_assigned",
+      "type": "say",
+      "next": "hangup",
+      "text": "Beklager, dette nummeret er dessverre ikke tilknyttet en veileder. Vennligst kontakt kundestøtten."
+    },
+    {
+      "id": "chk_agent_active",
+      "type": "condition",
+      "expr": "agent.online == true",
+      "then": "chk_agent_busy",
+      "else": "menu_unavailable"
+    },
+    {
+      "id": "chk_agent_busy",
+      "type": "condition",
+      "expr": "agent.busy == false",
+      "then": "chk_balance_600",
+      "else": "menu_agent_busy"
+    },
+    {
+      "id": "menu_unavailable",
+      "type": "menu",
+      "say": "Din veileder er for tiden ikke tilgjengelig",
+      "choices": {
+        "1": "sms_alert_subscribe",
+        "2": "opening_hours",
+        "*": "hangup"
+      },
+      "fallback": "menu_unavailable",
+      "timeout": 5,
+      "max_repeats": 2
+    },
+    {
+      "id": "menu_agent_busy",
+      "type": "menu",
+      "say": "Din veileder {agent.name} er for tiden i samtale. Prøv igjen senere eller tast 9 for SMS-hjelp.",
+      "choices": {
+        "9": "sms_help",
+        "*": "hangup"
+      },
+      "fallback": "menu_agent_busy",
+      "timeout": 5,
+      "max_repeats": 2
+    },
+    {
+      "id": "chk_balance_600",
+      "type": "condition",
+      "expr": "caller.balance > 600",
+      "then": "transfer_to_agent_info",
+      "else": "chk_balance_180"
+    },
+    {
+      "id": "chk_balance_180",
+      "type": "condition",
+      "expr": "caller.balance > 180",
+      "then": "menu_ready",
+      "else": "menu_low_balance"
+    },
+    {
+      "id": "transfer_to_agent_info",
+      "type": "say",
+      "next": "transfer_to_agent",
+      "text": "Du blir nå satt over til {agent.name}."
+    },
+    {
+      "id": "transfer_to_agent",
+      "type": "transfer",
+      "on_end": "welcome_again",
+      "to": "{agent.id}",
+      "timeout": 30
+    },
+    {
+      "id": "menu_ready",
+      "type": "menu",
+      "say": "Velkommen. Tjenesten koster {price_per_min} kroner per minutt fra du får svar. Du har {minutes_available} minutter tilgjengelig. For påfylling tast. en. For samtale med {agent.name} tast to. For saldo tast tre. For bistand på SMS tast ni.",
+      "choices": {
+        "1": "payment_menu",
+        "2": "transfer_to_agent_info",
+        "3": "balance_info",
+        "9": "sms_help"
+      },
+      "fallback": "menu_ready",
+      "timeout": 5,
+      "max_repeats": 2
+    },
+    {
+      "id": "menu_low_balance",
+      "type": "menu",
+      "say": "Tjenesten koster {price_per_min} kroner per minutt fra du får svar. Du har under 3 minutter tilgjengelig. For påfylling tast en. For bistand på SMS tast ni.",
+      "choices": {
+        "1": "payment_menu",
+        "9": "sms_help"
+      },
+      "fallback": "menu_low_balance",
+      "timeout": 5,
+      "max_repeats": 2
+    },
+    {
+      "id": "main_menu",
+      "type": "menu",
+      "say": "Hovedmeny. For påfylling tast. en. For samtale med {agent.name} tast to. For saldo tast tre. For bistand på SMS tast ni.",
+      "choices": {
+        "1": "payment_menu",
+        "2": "chk_balance_600",
+        "3": "balance_info",
+        "9": "sms_help"
+      },
+      "fallback": "main_menu",
+      "timeout": 5,
+      "max_repeats": 10
+    },
+    {
+      "id": "balance_info",
+      "type": "say",
+      "text": "Din forhåndsbetalte saldo er {minutes_available} minutter. Tast stjerne for å gå tilbake til hovedmenyen.",
+      "fallback": "balance_info",
+      "dtmf": {
+        "*": "main_menu"
+      },
+      "timeout": 5,
+      "max_repeats": 10
+    },
+    {
+      "id": "sms_help",
+      "type": "say",
+      "text": "Du vil nå motta nyttige linker på sms. . . ",
+      "fallback": "sms_help",
+      "dtmf": {
+        "*": "main_menu"
+      },
+      "timeout": 7,
+      "max_repeats": 2
+    },
+    {
+      "id": "payment_menu",
+      "type": "menu",
+      "say": "Dette er betalingsmenyen. Du får fem valg. For fem minutter tast en. For ti minutter tast to. For femten minutter tast tre. For tjue minutter tast fire. For tretti minutter tast fem. Tast stjerne for å gå tilbake til hovedmenyen.",
+      "choices": {
+        "1": "topup_5",
+        "2": "topup_10",
+        "3": "topup_15",
+        "4": "topup_20",
+        "5": "topup_30",
+        "*": "main_menu"
+      },
+      "fallback": "payment_menu",
+      "timeout": 5,
+      "max_repeats": 2
+    },
+    {
+      "id": "topup_5",
+      "type": "set",
+      "next": "send_payment_sms",
+      "values": {
+        "topup_amount": "{calc_amount_for_5}",
+        "topup_minutes": 5
+      }
+    },
+    {
+      "id": "topup_10",
+      "type": "set",
+      "next": "send_payment_sms",
+      "values": {
+        "topup_amount": "{calc_amount_for_10}",
+        "topup_minutes": 10
+      }
+    },
+    {
+      "id": "topup_15",
+      "type": "set",
+      "next": "send_payment_sms",
+      "values": {
+        "topup_amount": "{calc_amount_for_15}",
+        "topup_minutes": 15
+      }
+    },
+    {
+      "id": "topup_20",
+      "type": "set",
+      "next": "send_payment_sms",
+      "values": {
+        "topup_amount": "{calc_amount_for_20}",
+        "topup_minutes": 20
+      }
+    },
+    {
+      "id": "topup_30",
+      "type": "set",
+      "next": "send_payment_sms",
+      "values": {
+        "topup_amount": "{calc_amount_for_30}",
+        "topup_minutes": 30
+      }
+    },
+    {
+      "id": "send_payment_sms",
+      "type": "say",
+      "next": "send_payment_link",
+      "text": "Takk. Du vil nå motta SMS med betalingslenke."
+    },
+    {
+      "id": "send_payment_link",
+      "type": "action",
+      "next": "payment_sms_sent",
+      "action": "sms.send",
+      "params": {
+        "text": "Hei! For å betale for {topup_minutes} minutter, besøk: https://veiledersiden.no/fyll-pa?number={caller.phone}&minutes={topup_minutes}",
+        "to": "{caller.phone}"
+      }
+    },
+    {
+      "id": "payment_sms_sent",
+      "type": "say",
+      "next": "hangup",
+      "text": "SMS er sendt. Takk og ha en fin dag."
+    },
+    {
+      "id": "welcome_again",
+      "type": "say",
+      "next": "hangup",
+      "text": "Takk for at du brukte tjenesten vår. Ha en fin dag."
+    },
+    {
+      "id": "sms_alert_subscribe",
+      "type": "action",
+      "next": "main_menu",
+      "action": "notifications.subscribe_sms_alert",
+      "params": {
+        "agent_id": "{agent.id}",
+        "topic": "agent_back_online"
+      }
+    },
+    {
+      "id": "opening_hours",
+      "type": "action",
+      "next": "main_menu",
+      "action": "agent.play_opening_hours",
+      "params": {
+        "agent_id": "{agent.id}"
+      }
+    },
+    {
+      "id": "hangup",
+      "type": "hangup"
+    }
+]

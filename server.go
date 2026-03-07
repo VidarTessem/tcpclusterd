@@ -203,6 +203,11 @@ func main() {
 	// Check if this is a CLI command (not starting server)
 	isCLICommand := *export || *exportLastRuntime || *importFile != "" || *lastRuntime || *importPersistent || *listUsers || *listServices || *listCluster || *addUser != "" || *removeUser != "" || *flushTokens || *configHTTP != "" || *configTCP != "" || *configWS != "" || *peerMetrics || *addCluster != "" || *removeCluster != ""
 
+	// Print version only when starting server (no arguments)
+	if !isCLICommand {
+		fmt.Println("tcpclusterd version 1.0.4")
+	}
+
 	// If CLI command, try to use socket connection first (server is running)
 	// This MUST be done BEFORE initializing cluster manager
 	if isCLICommand {
@@ -1821,6 +1826,15 @@ func executeReplicatedWrite(writeOp *modules.WriteOperation) error {
 		_, err := db.DeleteRowsDirect(writeOp.Database, writeOp.Table, writeOp.Where, writeOp.IsPrivate)
 		return err
 
+	case "update":
+		// Use direct method to avoid recursive journal logging
+		_, err := db.UpdateRowsDirect(writeOp.Database, writeOp.Table, writeOp.Data, writeOp.Where, writeOp.IsPrivate)
+		return err
+
+	case "upsert":
+		// Use direct method to avoid recursive journal logging
+		return db.UpsertRowDirect(writeOp.Database, writeOp.Table, writeOp.Data, writeOp.IsPrivate)
+
 	case "import":
 		jsonStr, _ := writeOp.Data["json"].(string)
 		if jsonStr == "" {
@@ -2190,6 +2204,41 @@ func executeTCPCommand(req SocketRequest) SocketResponse {
 		return SocketResponse{Success: false, Message: fmt.Sprintf("failed to issue next token: %v", err)}
 	}
 
+	// Handle SQL query command
+	if req.Command == "query" {
+		sqlQuery, _ := req.Data["query"].(string)
+		if sqlQuery == "" {
+			return SocketResponse{Success: false, Message: "query field required"}
+		}
+
+		// Parse SQL command
+		parser := modules.NewSQLParser(db)
+		cmd, err := parser.Parse(sqlQuery)
+		if err != nil {
+			return SocketResponse{
+				Success: false,
+				Message: fmt.Sprintf("SQL parse error: %v", err),
+				Data:    map[string]interface{}{"token": nextToken},
+			}
+		}
+
+		// Execute SQL command
+		result, err := parser.Execute(cmd, username)
+		if err != nil {
+			return SocketResponse{
+				Success: false,
+				Message: fmt.Sprintf("SQL execution error: %v", err),
+				Data:    map[string]interface{}{"token": nextToken},
+			}
+		}
+
+		return SocketResponse{
+			Success: true,
+			Message: "query executed successfully",
+			Data:    map[string]interface{}{"result": result, "token": nextToken},
+		}
+	}
+
 	resp := executeSocketCommand(req)
 
 	// TCP export is sanitized by default.
@@ -2284,6 +2333,9 @@ func parseTCPTextCommand(input string) (SocketRequest, error) {
 			return SocketRequest{Command: "peermetrics", Data: map[string]interface{}{"peer_address": parts[1]}}, nil
 		}
 		return SocketRequest{Command: "peermetrics"}, nil
+	case "insert", "select", "update", "delete", "upsert":
+		// SQL command - return as query command with full input as query
+		return SocketRequest{Command: "query", Data: map[string]interface{}{"query": input}}, nil
 	default:
 		return SocketRequest{}, fmt.Errorf("unknown tcp command '%s'", cmd)
 	}

@@ -36,6 +36,8 @@ type HTTPServer struct {
 	replManager  *ReplicationManager
 	tokenManager *TokenManager
 	wsServer     *WebSocketServer
+	workerPool   *WorkerPool
+	shardManager *ShardManager
 	replToken    string
 	maxBodyBytes int64
 	authByIP     map[string]*authRateState
@@ -62,14 +64,65 @@ type QueryResponse struct {
 	Token   string      `json:"token,omitempty"`
 }
 
+// ImportRequest represents a JSON import request
+type ImportRequest struct {
+	Database string      `json:"database"`
+	Table    string      `json:"table"`
+	Private  bool        `json:"private"`
+	Data     interface{} `json:"data"`
+	Username string      `json:"username"`
+	Password string      `json:"password"`
+}
+
+func parseImportRows(data interface{}) ([]map[string]interface{}, error) {
+	if data == nil {
+		return nil, fmt.Errorf("data field required")
+	}
+
+	switch typed := data.(type) {
+	case map[string]interface{}:
+		return []map[string]interface{}{typed}, nil
+	case []interface{}:
+		rows := make([]map[string]interface{}, 0, len(typed))
+		for i, item := range typed {
+			row, ok := item.(map[string]interface{})
+			if !ok {
+				return nil, fmt.Errorf("data array element at index %d must be an object", i)
+			}
+			rows = append(rows, row)
+		}
+		return rows, nil
+	case string:
+		raw := strings.TrimSpace(typed)
+		if raw == "" {
+			return nil, fmt.Errorf("data field required")
+		}
+		var parsed interface{}
+		if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+			return nil, fmt.Errorf("data string must contain valid JSON object or array")
+		}
+		return parseImportRows(parsed)
+	default:
+		return nil, fmt.Errorf("data must be an object or array")
+	}
+}
+
 // NewHTTPServer creates a new HTTP server
 func NewHTTPServer(db *Database, replManager *ReplicationManager, tokenManager *TokenManager, wsServer *WebSocketServer, peerServer *PeerServer, clusterMgr *ClusterManager, replToken string) *HTTPServer {
+	// Initialize worker pool with 50 workers and 2000 job queue
+	workerPool := NewWorkerPool(50, 2000, GlobalLogger)
+
+	// Initialize shard manager
+	shardManager := NewShardManager(GlobalLogger)
+
 	hs := &HTTPServer{
 		db:           db,
 		parser:       NewSQLParser(db),
 		replManager:  replManager,
 		tokenManager: tokenManager,
 		wsServer:     wsServer,
+		workerPool:   workerPool,
+		shardManager: shardManager,
 		replToken:    replToken,
 		maxBodyBytes: defaultMaxRequestBodyBytes,
 		authByIP:     make(map[string]*authRateState),
@@ -415,6 +468,7 @@ func (hs *HTTPServer) RegisterHandlers() {
 	http.HandleFunc("/api/status", hs.handleStatus)
 	http.HandleFunc("/api/databases/", hs.handleDatabasePublic)
 	http.HandleFunc("/api/ws", hs.handleWebSocket)
+	http.HandleFunc("/api/import", hs.handleImport)
 	http.HandleFunc("/health", hs.handleHealth)
 }
 
@@ -799,11 +853,124 @@ func (hs *HTTPServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// IsWriteOperation checks if a query is a write operation (INSERT/DELETE/UPDATE)
+// handleImport handles direct JSON import without SQL escaping
+func (hs *HTTPServer) handleImport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	body, err := hs.readRequestBody(r)
+	if err != nil {
+		if errors.Is(err, errRequestBodyTooLarge) {
+			http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		http.Error(w, "Failed to read body", http.StatusBadRequest)
+		return
+	}
+	defer r.Body.Close()
+
+	var req ImportRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(QueryResponse{
+			OK:    false,
+			Error: "Invalid JSON: " + err.Error(),
+		})
+		return
+	}
+
+	// Authenticate
+	if req.Username == "" || req.Password == "" {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(QueryResponse{
+			OK:    false,
+			Error: "username and password required",
+		})
+		return
+	}
+
+	user, err := hs.db.AuthenticateUser(req.Username, req.Password)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(QueryResponse{
+			OK:    false,
+			Error: "authentication failed: " + err.Error(),
+		})
+		return
+	}
+
+	// Validate required fields
+	if req.Database == "" {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(QueryResponse{
+			OK:    false,
+			Error: "database field required",
+		})
+		return
+	}
+
+	if req.Table == "" {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(QueryResponse{
+			OK:    false,
+			Error: "table field required",
+		})
+		return
+	}
+
+	rows, err := parseImportRows(req.Data)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(QueryResponse{
+			OK:    false,
+			Error: err.Error(),
+		})
+		return
+	}
+
+	// Check permissions
+	if !hs.db.userHasAccessToDatabase(user.Username, req.Database, "rw") {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(QueryResponse{
+			OK:    false,
+			Error: "access denied to database: " + req.Database,
+		})
+		return
+	}
+
+	inserted := 0
+	for i, row := range rows {
+		if _, err := hs.db.InsertRow(req.Database, req.Table, row, req.Private); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(QueryResponse{
+				OK:    false,
+				Error: fmt.Sprintf("insert failed at index %d: %v", i, err),
+			})
+			return
+		}
+		inserted++
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(QueryResponse{
+		OK: true,
+		Data: map[string]interface{}{
+			"status":   "ok",
+			"inserted": inserted,
+			"table":    req.Table,
+			"database": req.Database,
+		},
+	})
+}
+
+// IsWriteOperation checks if a query is a write operation (INSERT/DELETE/UPDATE/UPSERT)
 func IsWriteOperation(query string) bool {
 	// Remove leading whitespace
 	trimmed := strings.TrimSpace(strings.ToUpper(query))
 	return strings.HasPrefix(trimmed, "INSERT") ||
+		strings.HasPrefix(trimmed, "UPSERT") ||
 		strings.HasPrefix(trimmed, "DELETE") ||
 		strings.HasPrefix(trimmed, "UPDATE")
 }

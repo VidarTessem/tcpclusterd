@@ -1,0 +1,54 @@
+{
+  "databases": {
+    "system": {
+      "name": "system",
+      "public_tables": {
+        "peer_metrics": [
+          {
+            "created_at": 1772893351,
+            "is_online": false,
+            "last_ping": 1772893351,
+            "peer_address": "127.0.0.1:5000",
+            "replication_failures": 0,
+            "replication_lag_ms": 0,
+            "updated_at": 1772893351,
+            "writes_replicated": 0
+          },
+          {
+            "created_at": 1772893351,
+            "is_online": false,
+            "last_ping": 1772893351,
+            "peer_address": "192.168.1.100:5000",
+            "replication_failures": 0,
+            "replication_lag_ms": 0,
+            "updated_at": 1772893351,
+            "writes_replicated": 0
+          },
+          {
+            "created_at": 1772893351,
+            "is_online": false,
+            "last_ping": 1772893351,
+            "peer_address": "192.168.1.101:5000",
+            "replication_failures": 0,
+            "replication_lag_ms": 0,
+            "updated_at": 1772893351,
+            "writes_replicated": 0
+          }
+        ]
+      },
+      "private_tables": {
+        "tokens": [],
+        "users": [
+          {
+            "created_at": 1772893351,
+            "is_admin": true,
+            "password_hash": "c7ad44cbad762a5da0a452f9e854fdc1e0e7a52a38015f23f3eab1d80b931dd472634dfac71cd34ebc35d16ab7fb8a90c81f975113d6c7538dc69dd8de9077ec",
+            "username": "admin"
+          }
+        ]
+      },
+      "last_modified": "2026-03-07T15:22:31.113085+01:00"
+    }
+  },
+  "timestamp": "2026-03-07T15:23:01.11531+01:00"
+}

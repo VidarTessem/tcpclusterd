@@ -26,6 +26,7 @@ type ReplicationManager struct {
 	processedEvents map[string]time.Time
 	processedOrder  []string
 	maxProcessed    int
+	httpClient      *http.Client // Shared HTTP client with connection pooling
 }
 
 // ReplicationEvent represents an event to replicate to peers
@@ -43,6 +44,15 @@ type ReplicationEvent struct {
 
 // NewReplicationManager creates a new replication manager
 func NewReplicationManager(db *Database, peers []string, replToken string) *ReplicationManager {
+	// Create HTTP client with connection pooling
+	transport := &http.Transport{
+		MaxIdleConns:        100,              // Total idle connections across all hosts
+		MaxIdleConnsPerHost: 10,               // Idle connections per peer
+		IdleConnTimeout:     90 * time.Second, // Keep connections alive
+		DisableKeepAlives:   false,            // Enable keep-alive
+		ForceAttemptHTTP2:   true,             // Use HTTP/2 if available
+	}
+
 	rm := &ReplicationManager{
 		db:              db,
 		peers:           peers,
@@ -53,6 +63,10 @@ func NewReplicationManager(db *Database, peers []string, replToken string) *Repl
 		processedEvents: make(map[string]time.Time),
 		processedOrder:  make([]string, 0, 1024),
 		maxProcessed:    10000,
+		httpClient: &http.Client{
+			Timeout:   5 * time.Second,
+			Transport: transport,
+		},
 	}
 
 	// Start replication worker
@@ -225,8 +239,8 @@ func (rm *ReplicationManager) sendToPeer(peer string, payload []byte, attempt in
 		req.Header.Set("X-Replication-Token", rm.replToken)
 	}
 
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
+	// Use shared HTTP client with connection pooling
+	resp, err := rm.httpClient.Do(req)
 	if err != nil {
 		fmt.Printf("failed to send replication to peer %s (attempt %d): %v\n", peer, attempt+1, err)
 		time.Sleep(rm.retryDelay)

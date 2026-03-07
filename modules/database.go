@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -549,6 +550,177 @@ func (db *Database) DeleteRowsDirect(databaseName, tableName string, where map[s
 	return deletedCount, nil
 }
 
+// UpdateRows updates matching rows in a table
+func (db *Database) UpdateRows(databaseName, tableName string, updateData map[string]interface{}, where map[string]string, isPrivate bool) (interface{}, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	dbInstance, exists := db.data[databaseName]
+	if !exists {
+		return nil, fmt.Errorf("database not found: %s", databaseName)
+	}
+
+	var tableData []interface{}
+	if isPrivate {
+		tableData = dbInstance.PrivateTables[tableName]
+	} else {
+		tableData = dbInstance.PublicTables[tableName]
+	}
+
+	if tableData == nil {
+		return map[string]interface{}{"status": "ok", "updated": 0}, nil
+	}
+
+	updatedCount := 0
+	for i, row := range tableData {
+		rowMap, ok := row.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		matches := true
+		for key, val := range where {
+			rowVal, exists := rowMap[key]
+			if !exists || fmt.Sprintf("%v", rowVal) != val {
+				matches = false
+				break
+			}
+		}
+
+		if !matches {
+			continue
+		}
+
+		for key, val := range updateData {
+			rowMap[key] = val
+		}
+		tableData[i] = rowMap
+		updatedCount++
+	}
+
+	if isPrivate {
+		dbInstance.PrivateTables[tableName] = tableData
+	} else {
+		dbInstance.PublicTables[tableName] = tableData
+	}
+
+	dbInstance.LastModified = time.Now()
+	db.LogWrite("update", databaseName, tableName, updateData, where, isPrivate)
+
+	return map[string]interface{}{"status": "ok", "updated": updatedCount}, nil
+}
+
+// UpdateRowsDirect updates matching rows without journaling (for replicated writes)
+func (db *Database) UpdateRowsDirect(databaseName, tableName string, updateData map[string]interface{}, where map[string]string, isPrivate bool) (int, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	dbInstance, exists := db.data[databaseName]
+	if !exists {
+		return 0, fmt.Errorf("database not found: %s", databaseName)
+	}
+
+	var tableData []interface{}
+	if isPrivate {
+		tableData = dbInstance.PrivateTables[tableName]
+	} else {
+		tableData = dbInstance.PublicTables[tableName]
+	}
+
+	if tableData == nil {
+		return 0, nil
+	}
+
+	updatedCount := 0
+	for i, row := range tableData {
+		rowMap, ok := row.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		matches := true
+		for key, val := range where {
+			rowVal, exists := rowMap[key]
+			if !exists || fmt.Sprintf("%v", rowVal) != val {
+				matches = false
+				break
+			}
+		}
+
+		if !matches {
+			continue
+		}
+
+		for key, val := range updateData {
+			rowMap[key] = val
+		}
+		tableData[i] = rowMap
+		updatedCount++
+	}
+
+	if isPrivate {
+		dbInstance.PrivateTables[tableName] = tableData
+	} else {
+		dbInstance.PublicTables[tableName] = tableData
+	}
+
+	dbInstance.LastModified = time.Now()
+	return updatedCount, nil
+}
+
+func upsertWhereFromRow(rowData map[string]interface{}) map[string]string {
+	if v, ok := rowData["id"]; ok && fmt.Sprintf("%v", v) != "" {
+		return map[string]string{"id": fmt.Sprintf("%v", v)}
+	}
+	if v, ok := rowData["call_sid"]; ok && fmt.Sprintf("%v", v) != "" {
+		return map[string]string{"call_sid": fmt.Sprintf("%v", v)}
+	}
+	return nil
+}
+
+// UpsertRow updates existing row (id/call_sid) or inserts a new row
+func (db *Database) UpsertRow(databaseName, tableName string, rowData map[string]interface{}, isPrivate bool) (interface{}, error) {
+	where := upsertWhereFromRow(rowData)
+	if where == nil {
+		return db.InsertRow(databaseName, tableName, rowData, isPrivate)
+	}
+
+	result, err := db.UpdateRows(databaseName, tableName, rowData, where, isPrivate)
+	if err != nil {
+		return nil, err
+	}
+
+	if resultMap, ok := result.(map[string]interface{}); ok {
+		if updatedRaw, ok := resultMap["updated"]; ok && fmt.Sprintf("%v", updatedRaw) != "0" {
+			return map[string]interface{}{"status": "ok", "operation": "updated", "updated": updatedRaw}, nil
+		}
+	}
+
+	insertResult, err := db.InsertRow(databaseName, tableName, rowData, isPrivate)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]interface{}{"status": "ok", "operation": "inserted", "result": insertResult}, nil
+}
+
+// UpsertRowDirect updates or inserts without journaling (for replicated writes)
+func (db *Database) UpsertRowDirect(databaseName, tableName string, rowData map[string]interface{}, isPrivate bool) error {
+	where := upsertWhereFromRow(rowData)
+	if where == nil {
+		return db.InsertRowDirect(databaseName, tableName, rowData, isPrivate)
+	}
+
+	updated, err := db.UpdateRowsDirect(databaseName, tableName, rowData, where, isPrivate)
+	if err != nil {
+		return err
+	}
+	if updated > 0 {
+		return nil
+	}
+
+	return db.InsertRowDirect(databaseName, tableName, rowData, isPrivate)
+}
+
 // ConfigureServiceDirect updates service configuration without logging to journal
 // This is used during replication to avoid recursive journal entries
 func (db *Database) ConfigureServiceDirect(serviceData map[string]interface{}) error {
@@ -744,7 +916,22 @@ func (db *Database) GetAllDatabases() []string {
 	return names
 }
 
-// UpdatePeerMetrics updates or creates a peer metrics entry, removing duplicates
+// extractIPFromAddress extracts the IP address from a "host:port" or "[ipv6]:port" format
+func extractIPFromAddress(address string) string {
+	// Handle IPv6 with brackets: [2a03:94e0:205b:d:1::aaab]:5000
+	if strings.HasPrefix(address, "[") {
+		if idx := strings.Index(address, "]"); idx > 0 {
+			return address[1:idx]
+		}
+	}
+	// Handle IPv4 or hostname: 192.168.1.1:5000
+	if idx := strings.LastIndex(address, ":"); idx > 0 {
+		return address[:idx]
+	}
+	return address
+}
+
+// UpdatePeerMetrics updates or creates a peer metrics entry, removing duplicates by IP (ignoring port)
 func (db *Database) UpdatePeerMetrics(peerAddress string, isOnline bool, lastPing time.Time, replicationLag int64, writesReplicated int64, replicationFailures int64) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -759,16 +946,34 @@ func (db *Database) UpdatePeerMetrics(peerAddress string, isOnline bool, lastPin
 		metrics = db.data["system"].PublicTables["peer_metrics"]
 	}
 
-	// Find and update existing metric entry, or remove duplicates of this peer
+	// Extract IP without port for comparison
+	peerIP := extractIPFromAddress(peerAddress)
+
+	// Find and update existing metric entry, or remove duplicates by IP (ignoring port)
 	foundIndex := -1
 	var newMetrics []interface{}
 	for i, m := range metrics {
 		if entry, ok := m.(map[string]interface{}); ok {
-			if addr, ok := entry["peer_address"].(string); ok && addr == peerAddress {
-				if foundIndex == -1 {
-					foundIndex = i
+			if addr, ok := entry["peer_address"].(string); ok {
+				// Compare IPs only, not full address with port
+				existingIP := extractIPFromAddress(addr)
+				if existingIP == peerIP {
+					if foundIndex == -1 {
+						foundIndex = i
+						// Aggregate stats from duplicate entries
+						if wr, ok := entry["writes_replicated"].(int64); ok {
+							writesReplicated += wr
+						} else if wr, ok := entry["writes_replicated"].(float64); ok {
+							writesReplicated += int64(wr)
+						}
+						if rf, ok := entry["replication_failures"].(int64); ok {
+							replicationFailures += rf
+						} else if rf, ok := entry["replication_failures"].(float64); ok {
+							replicationFailures += int64(rf)
+						}
+					}
+					continue // Skip all existing entries for this IP (remove duplicates)
 				}
-				continue // Skip all existing entries for this peer (remove duplicates)
 			}
 		}
 		newMetrics = append(newMetrics, m)
@@ -792,7 +997,7 @@ func (db *Database) UpdatePeerMetrics(peerAddress string, isOnline bool, lastPin
 	return nil
 }
 
-// GetPeerMetrics retrieves all peer metrics, filtering duplicates and stale entries
+// GetPeerMetrics retrieves all peer metrics, filtering duplicates by IP (ignoring port) and stale entries
 func (db *Database) GetPeerMetrics() ([]map[string]interface{}, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
@@ -803,7 +1008,7 @@ func (db *Database) GetPeerMetrics() ([]map[string]interface{}, error) {
 
 	metrics := db.data["system"].PublicTables["peer_metrics"]
 	result := make([]map[string]interface{}, 0)
-	// Track seen peers by address to filter duplicates (keep most recent)
+	// Track seen peers by IP (not full address) to filter duplicates (keep most recent)
 	seenPeers := make(map[string]map[string]interface{})
 	now := time.Now().Unix()
 
@@ -821,19 +1026,68 @@ func (db *Database) GetPeerMetrics() ([]map[string]interface{}, error) {
 					continue // Skip stale entry
 				}
 
-				// If we've seen this peer address, keep the one with the latest ping
-				if existing, seen := seenPeers[addr]; seen {
+				// Extract IP without port for deduplication
+				peerIP := extractIPFromAddress(addr)
+
+				// If we've seen this peer IP, keep the one with the latest ping and aggregate stats
+				if existing, seen := seenPeers[peerIP]; seen {
 					var existingPing int64
 					if ep, ok := existing["last_ping"].(float64); ok {
 						existingPing = int64(ep)
 					} else if ep, ok := existing["last_ping"].(int64); ok {
 						existingPing = ep
 					}
+					// Keep entry with latest ping, but aggregate stats
 					if lastPing > existingPing {
-						seenPeers[addr] = entry
+						// Aggregate writes and failures from old entry
+						var aggWrites, aggFailures int64
+						if wr, ok := existing["writes_replicated"].(int64); ok {
+							aggWrites += wr
+						} else if wr, ok := existing["writes_replicated"].(float64); ok {
+							aggWrites += int64(wr)
+						}
+						if rf, ok := existing["replication_failures"].(int64); ok {
+							aggFailures += rf
+						} else if rf, ok := existing["replication_failures"].(float64); ok {
+							aggFailures += int64(rf)
+						}
+						// Add current entry stats
+						if wr, ok := entry["writes_replicated"].(int64); ok {
+							aggWrites += wr
+						} else if wr, ok := entry["writes_replicated"].(float64); ok {
+							aggWrites += int64(wr)
+						}
+						if rf, ok := entry["replication_failures"].(int64); ok {
+							aggFailures += rf
+						} else if rf, ok := entry["replication_failures"].(float64); ok {
+							aggFailures += int64(rf)
+						}
+						entry["writes_replicated"] = aggWrites
+						entry["replication_failures"] = aggFailures
+						seenPeers[peerIP] = entry
+					} else {
+						// Keep existing, add stats from new entry
+						if wr, ok := entry["writes_replicated"].(int64); ok {
+							if ewr, ok := existing["writes_replicated"].(int64); ok {
+								existing["writes_replicated"] = ewr + wr
+							}
+						} else if wr, ok := entry["writes_replicated"].(float64); ok {
+							if ewr, ok := existing["writes_replicated"].(float64); ok {
+								existing["writes_replicated"] = ewr + wr
+							}
+						}
+						if rf, ok := entry["replication_failures"].(int64); ok {
+							if erf, ok := existing["replication_failures"].(int64); ok {
+								existing["replication_failures"] = erf + rf
+							}
+						} else if rf, ok := entry["replication_failures"].(float64); ok {
+							if erf, ok := existing["replication_failures"].(float64); ok {
+								existing["replication_failures"] = erf + rf
+							}
+						}
 					}
 				} else {
-					seenPeers[addr] = entry
+					seenPeers[peerIP] = entry
 				}
 			}
 		}

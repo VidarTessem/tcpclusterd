@@ -3,6 +3,7 @@ package modules
 import (
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -38,6 +39,11 @@ func (sp *SQLParser) Parse(query string) (*SQLCommand, error) {
 	// Check for INSERT
 	if strings.HasPrefix(strings.ToUpper(query), "INSERT") {
 		return sp.parseInsert(query)
+	}
+
+	// Check for UPSERT
+	if strings.HasPrefix(strings.ToUpper(query), "UPSERT") {
+		return sp.parseUpsert(query)
 	}
 
 	// Check for SELECT
@@ -82,7 +88,8 @@ func (sp *SQLParser) parseInsert(query string) (*SQLCommand, error) {
 
 	// Extract table name and columns
 	// Pattern: INSERT INTO database.table (col1, col2) VALUES
-	re := regexp.MustCompile(`INSERT\s+INTO\s+(\w+)\.(\w+)\s*\((.*?)\)\s*VALUES\s*\((.*?)\)`)
+	// Note: Use greedy (.*) for VALUES to capture JSON with parentheses
+	re := regexp.MustCompile(`INSERT\s+INTO\s+(\w+)\.(\w+)\s*\((.*?)\)\s*VALUES\s*\((.*)\)`)
 	matches := re.FindStringSubmatch(query)
 
 	if len(matches) == 0 {
@@ -98,34 +105,166 @@ func (sp *SQLParser) parseInsert(query string) (*SQLCommand, error) {
 		cmd.Columns = append(cmd.Columns, strings.TrimSpace(col))
 	}
 
+	// Parse values - need to handle escaped quotes and commas inside strings
+	valuesStr := matches[4]
+	cmd.Values = sp.parseValuesList(valuesStr)
+
+	return cmd, nil
+}
+
+// parseUpsert parses UPSERT commands
+// UPSERT PRIVATE INTO database.table (col1, col2) VALUES (val1, val2)
+// UPSERT PUBLIC INTO database.table (col1, col2) VALUES (val1, val2)
+// UPSERT INTO database.table (...) VALUES (...) defaults to PRIVATE
+func (sp *SQLParser) parseUpsert(query string) (*SQLCommand, error) {
+	cmd := &SQLCommand{Type: "UPSERT"}
+
+	upperQuery := strings.ToUpper(query)
+
+	// Determine scope (PRIVATE/PUBLIC)
+	if strings.Contains(upperQuery, "UPSERT PRIVATE") {
+		cmd.Scope = "PRIVATE"
+		query = strings.Replace(query, "UPSERT PRIVATE", "UPSERT", 1)
+		upperQuery = strings.ToUpper(query)
+	} else if strings.Contains(upperQuery, "UPSERT PUBLIC") {
+		cmd.Scope = "PUBLIC"
+		query = strings.Replace(query, "UPSERT PUBLIC", "UPSERT", 1)
+		upperQuery = strings.ToUpper(query)
+	} else {
+		// Default to PRIVATE
+		cmd.Scope = "PRIVATE"
+	}
+
+	// Pattern: UPSERT [PRIVATE|PUBLIC] INTO database.table (col1, col2) VALUES
+	// Note: Use greedy (.*) for VALUES to capture JSON with parentheses
+	re := regexp.MustCompile(`UPSERT\s+(?:PRIVATE\s+|PUBLIC\s+)?INTO\s+(\w+)\.(\w+)\s*\((.*?)\)\s*VALUES\s*\((.*)\)`)
+	matches := re.FindStringSubmatch(query)
+
+	if len(matches) == 0 {
+		return nil, fmt.Errorf("invalid UPSERT syntax")
+	}
+
+	cmd.Database = matches[1]
+	cmd.Table = matches[2]
+
+	// Parse columns
+	cols := strings.Split(matches[3], ",")
+	for _, col := range cols {
+		cmd.Columns = append(cmd.Columns, strings.TrimSpace(col))
+	}
+
 	// Parse values
-	vals := strings.Split(matches[4], ",")
-	for _, val := range vals {
-		val = strings.TrimSpace(val)
-		// Remove quotes if present
-		if strings.HasPrefix(val, "'") && strings.HasSuffix(val, "'") {
-			val = val[1 : len(val)-1]
-		} else if strings.HasPrefix(val, "\"") && strings.HasSuffix(val, "\"") {
-			val = val[1 : len(val)-1]
-		}
-		// Check if it's a function call (like password())
-		if strings.HasPrefix(strings.ToLower(val), "password(") {
-			// Extract the actual value from password()
-			inner := strings.TrimPrefix(strings.ToLower(val), "password(")
-			inner = strings.TrimSuffix(inner, ")")
-			inner = strings.TrimSpace(inner)
-			// Remove quotes from inner value
-			if strings.HasPrefix(inner, "'") && strings.HasSuffix(inner, "'") {
-				inner = inner[1 : len(inner)-1]
+	valuesStr := matches[4]
+	cmd.Values = sp.parseValuesList(valuesStr)
+
+	return cmd, nil
+}
+
+// parseValuesList parses comma-separated values respecting quotes and escapes
+func (sp *SQLParser) parseValuesList(valuesStr string) []interface{} {
+	// DEBUG: Log VALUES parsing input
+	if GlobalLogger != nil {
+		GlobalLogger.Debug("[VALUES:parse] input_len=%d preview=%s", len(valuesStr), truncateForLog(valuesStr, 150))
+	}
+
+	var values []interface{}
+	var current strings.Builder
+	inQuote := false
+	quoteChar := byte(0)
+
+	for i := 0; i < len(valuesStr); i++ {
+		ch := valuesStr[i]
+
+		if inQuote {
+			if ch == quoteChar {
+				// SQL escaped quote inside quoted value: '' or ""
+				if i+1 < len(valuesStr) && valuesStr[i+1] == quoteChar {
+					current.WriteByte(ch)
+					i++
+					continue
+				}
+				// End quote
+				inQuote = false
+				quoteChar = 0
+				continue
 			}
-			hashedVal := sp.db.hashPassword(inner)
-			cmd.Values = append(cmd.Values, hashedVal)
+			current.WriteByte(ch)
+			continue
+		}
+
+		if ch == '\'' || ch == '"' {
+			inQuote = true
+			quoteChar = ch
+			continue
+		}
+
+		if ch == ',' {
+			val := strings.TrimSpace(current.String())
+			// Always append value, even if empty (empty strings are valid SQL values)
+			val = sp.unescapeSQLString(val)
+			// Try to convert to numeric type
+			if num, err := strconv.ParseInt(val, 10, 64); err == nil {
+				values = append(values, int(num))
+			} else if num, err := strconv.ParseFloat(val, 64); err == nil {
+				values = append(values, num)
+			} else {
+				values = append(values, val)
+			}
+			current.Reset()
+			continue
+		}
+
+		current.WriteByte(ch)
+	}
+
+	// Add last value
+	if current.Len() > 0 || (len(valuesStr) > 0 && valuesStr[len(valuesStr)-1] == ',') {
+		val := strings.TrimSpace(current.String())
+		// Always append value, even if empty (empty strings are valid SQL values)
+		val = sp.unescapeSQLString(val)
+		// Try to convert to numeric type
+		if num, err := strconv.ParseInt(val, 10, 64); err == nil {
+			values = append(values, int(num))
+		} else if num, err := strconv.ParseFloat(val, 64); err == nil {
+			values = append(values, num)
 		} else {
-			cmd.Values = append(cmd.Values, val)
+			values = append(values, val)
+		}
+		GlobalLogger.Debug("[VALUES:parsed] count=%d first=%s last=%s", len(values), truncateForLog(getValueSafe(values, 0), 50), truncateForLog(getValueSafe(values, len(values)-1), 50))
+		if len(values) > 8 {
+			GlobalLogger.Debug("[VALUES:samples] v[8]=%s v[9]=%s v[10]=%s", truncateForLog(getValueSafe(values, 8), 40), truncateForLog(getValueSafe(values, 9), 40), truncateForLog(getValueSafe(values, 10), 40))
 		}
 	}
 
-	return cmd, nil
+	return values
+}
+
+// Helper functions for debug logging
+func truncateForLog(s string, maxLen int) string {
+	str := fmt.Sprintf("%v", s)
+	if len(str) <= maxLen {
+		return str
+	}
+	return str[:maxLen] + "..."
+}
+
+func getValueSafe(values []interface{}, idx int) string {
+	if idx < 0 || idx >= len(values) {
+		return "<none>"
+	}
+	return fmt.Sprintf("%v", values[idx])
+}
+
+// unescapeSQLString reverses SQL escaping
+func (sp *SQLParser) unescapeSQLString(s string) string {
+	// Unescape in reverse order of escaping
+	s = strings.ReplaceAll(s, "\\t", "\t")
+	s = strings.ReplaceAll(s, "\\r", "\r")
+	s = strings.ReplaceAll(s, "\\n", "\n")
+	s = strings.ReplaceAll(s, "\\\"", "\"")
+	s = strings.ReplaceAll(s, "''", "'")
+	s = strings.ReplaceAll(s, "\\\\", "\\")
+	return s
 }
 
 // parseSelect parses SELECT commands
@@ -224,28 +363,140 @@ func (sp *SQLParser) parseDelete(query string) (*SQLCommand, error) {
 func (sp *SQLParser) parseUpdate(query string) (*SQLCommand, error) {
 	cmd := &SQLCommand{Type: "UPDATE", Scope: "PRIVATE"}
 
-	upperQuery := strings.ToUpper(query)
-	if !strings.Contains(upperQuery, "UPDATE") {
+	re := regexp.MustCompile(`(?i)^UPDATE(?:\s+(PRIVATE|PUBLIC))?\s+(\w+)\.(\w+)\s+SET\s+(.+?)(?:\s+WHERE\s+(.+))?$`)
+	matches := re.FindStringSubmatch(strings.TrimSpace(query))
+	if len(matches) == 0 {
 		return nil, fmt.Errorf("invalid UPDATE syntax")
 	}
 
-	// Extract table
-	parts := strings.Split(query, "SET")
-	if len(parts) < 2 {
-		return nil, fmt.Errorf("invalid UPDATE syntax")
+	scope := strings.ToUpper(strings.TrimSpace(matches[1]))
+	if scope == "PUBLIC" {
+		cmd.Scope = "PUBLIC"
+	} else {
+		cmd.Scope = "PRIVATE"
 	}
 
-	tablePart := strings.TrimSpace(strings.Replace(parts[0], "UPDATE", "", 1))
-	tableParts := strings.Split(tablePart, ".")
+	cmd.Database = strings.TrimSpace(matches[2])
+	cmd.Table = strings.TrimSpace(matches[3])
 
-	if len(tableParts) != 2 {
-		return nil, fmt.Errorf("expected database.table format")
+	setClause := strings.TrimSpace(matches[4])
+	if setClause == "" {
+		return nil, fmt.Errorf("UPDATE requires SET clause")
 	}
 
-	cmd.Database = strings.TrimSpace(tableParts[0])
-	cmd.Table = strings.TrimSpace(tableParts[1])
+	assignments := sp.splitCSVRespectQuotes(setClause)
+	for _, assignment := range assignments {
+		kv := sp.splitAssignmentRespectQuotes(assignment)
+		if len(kv) != 2 {
+			return nil, fmt.Errorf("invalid SET assignment: %s", assignment)
+		}
+		cmd.Columns = append(cmd.Columns, strings.TrimSpace(kv[0]))
+		cmd.Values = append(cmd.Values, sp.parseSQLLiteral(kv[1]))
+	}
+
+	if len(matches) > 5 && strings.TrimSpace(matches[5]) != "" {
+		cmd.Where = sp.parseWhereClause(strings.TrimSpace(matches[5]))
+	}
 
 	return cmd, nil
+}
+
+func (sp *SQLParser) splitCSVRespectQuotes(input string) []string {
+	parts := make([]string, 0)
+	var current strings.Builder
+	inQuote := false
+	quoteChar := rune(0)
+	escaped := false
+
+	for i, ch := range input {
+		if escaped {
+			current.WriteRune(ch)
+			escaped = false
+			continue
+		}
+
+		if ch == '\\' {
+			escaped = true
+			current.WriteRune(ch)
+			continue
+		}
+
+		if (ch == '\'' || ch == '"') && !inQuote {
+			inQuote = true
+			quoteChar = ch
+			current.WriteRune(ch)
+			continue
+		}
+
+		if inQuote && ch == quoteChar {
+			if i+1 < len(input) && rune(input[i+1]) == quoteChar {
+				// Escaped quote in SQL style ''
+				current.WriteRune(ch)
+				continue
+			}
+			inQuote = false
+			quoteChar = 0
+			current.WriteRune(ch)
+			continue
+		}
+
+		if ch == ',' && !inQuote {
+			part := strings.TrimSpace(current.String())
+			if part != "" {
+				parts = append(parts, part)
+			}
+			current.Reset()
+			continue
+		}
+
+		current.WriteRune(ch)
+	}
+
+	if tail := strings.TrimSpace(current.String()); tail != "" {
+		parts = append(parts, tail)
+	}
+
+	return parts
+}
+
+func (sp *SQLParser) splitAssignmentRespectQuotes(input string) []string {
+	inQuote := false
+	quoteChar := rune(0)
+	escaped := false
+
+	for i, ch := range input {
+		if escaped {
+			escaped = false
+			continue
+		}
+		if ch == '\\' {
+			escaped = true
+			continue
+		}
+		if (ch == '\'' || ch == '"') && !inQuote {
+			inQuote = true
+			quoteChar = ch
+			continue
+		}
+		if inQuote && ch == quoteChar {
+			inQuote = false
+			quoteChar = 0
+			continue
+		}
+		if ch == '=' && !inQuote {
+			return []string{strings.TrimSpace(input[:i]), strings.TrimSpace(input[i+1:])}
+		}
+	}
+
+	return nil
+}
+
+func (sp *SQLParser) parseSQLLiteral(raw string) interface{} {
+	val := strings.TrimSpace(raw)
+	if (strings.HasPrefix(val, "'") && strings.HasSuffix(val, "'")) || (strings.HasPrefix(val, "\"") && strings.HasSuffix(val, "\"")) {
+		val = val[1 : len(val)-1]
+	}
+	return sp.unescapeSQLString(val)
 }
 
 // parseWhereClause parses WHERE conditions
@@ -276,6 +527,8 @@ func (sp *SQLParser) Execute(cmd *SQLCommand, username string) (interface{}, err
 	switch cmd.Type {
 	case "INSERT":
 		return sp.executeInsert(cmd, username)
+	case "UPSERT":
+		return sp.executeUpsert(cmd, username)
 	case "SELECT":
 		return sp.executeSelect(cmd, username)
 	case "DELETE":
@@ -343,12 +596,45 @@ func (sp *SQLParser) executeDelete(cmd *SQLCommand, username string) (interface{
 
 // executeUpdate updates data in a table
 func (sp *SQLParser) executeUpdate(cmd *SQLCommand, username string) (interface{}, error) {
+	isPrivate := cmd.Scope == "PRIVATE"
+
 	// Check permissions
 	if !sp.db.userHasAccessToDatabase(username, cmd.Database, "rw") {
 		return nil, fmt.Errorf("access denied")
 	}
 
-	return nil, fmt.Errorf("UPDATE not yet implemented")
+	updateData := make(map[string]interface{})
+	for i, col := range cmd.Columns {
+		if i < len(cmd.Values) {
+			updateData[col] = cmd.Values[i]
+		}
+	}
+
+	return sp.db.UpdateRows(cmd.Database, cmd.Table, updateData, cmd.Where, isPrivate)
+
+}
+
+// executeUpsert inserts or updates data in a table
+func (sp *SQLParser) executeUpsert(cmd *SQLCommand, username string) (interface{}, error) {
+	isPrivate := cmd.Scope == "PRIVATE"
+
+	// Check permissions
+	if isPrivate && !sp.db.userHasAccessToDatabase(username, cmd.Database, "rw") {
+		return nil, fmt.Errorf("access denied")
+	}
+
+	if !isPrivate && !sp.db.userHasAccessToDatabase(username, cmd.Database, "ro") && !sp.db.userHasAccessToDatabase(username, cmd.Database, "rw") {
+		return nil, fmt.Errorf("access denied")
+	}
+
+	rowData := make(map[string]interface{})
+	for i, col := range cmd.Columns {
+		if i < len(cmd.Values) {
+			rowData[col] = cmd.Values[i]
+		}
+	}
+
+	return sp.db.UpsertRow(cmd.Database, cmd.Table, rowData, isPrivate)
 }
 
 // ConvertJSONToSQLInsert converts JSON row to SQL INSERT statement
