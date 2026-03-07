@@ -1,7 +1,0 @@
-
-[APP] 2026/03/07 15:22:31 [INFO] Identified local peer: 127.0.0.1:5000
-[APP] 2026/03/07 15:22:31 [INFO] Cluster manager initialized. Local peer: 127.0.0.1:5000. Total peers: 3
-[APP] 2026/03/07 15:22:31 [INFO] Starting cluster node at 127.0.0.1:5000
-[APP] 2026/03/07 15:22:31 [INFO] Peer server listening on 127.0.0.1:5000
-[APP] 2026/03/07 15:22:31 [INFO] Peer server started for cluster communication
-[APP] 2026/03/07 15:22:31 [INFO] Worker pool started with 50 workers (queue size: 2000)
