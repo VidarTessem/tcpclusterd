@@ -1,164 +1,151 @@
-# tcpclusterd - Production Cluster Database
+# tcpclusterd - Distributed SQL Database
 
-A distributed SQL-like database for managing **public and private data** simultaneously, with built-in cluster replication, authentication, and real-time data synchronization.
-
-## Use Cases
-
-### Primary Use Case: Agent Status System
-Imagine a **customer-facing website** where agents handle phone calls:
-- **Public Data** (show to website visitors): Agent ID, Agent Name, Status (Online/Offline), Last Updated
-- **Private Data** (never exposed): Agent's Real Phone Number, Password, Internal ID, Email
-
-**Problem**: You need to show agent availability in real-time to customers without exposing sensitive information.
-
-**Solution**: tcpclusterd stores all data in one database but exports only public fields via API.
-
-**Example**:
-```json
-// Stored internally (private access)
-{
-  "agent_id": "agent_001",
-  "agent_name": "John Smith",
-  "status": "online",
-  "phone_number": "+47-555-1234",     // PRIVATE
-  "email": "john@company.no",          // PRIVATE
-  "real_phone": "93949555"             // PRIVATE
-}
-
-// When customer queries /api/query for PUBLIC table
-// They only see:
-{
-  "agent_id": "agent_001",
-  "agent_name": "John Smith",
-  "status": "online"
-}
-```
+En distribuert SQL-lignende database med innebygd klyngereplikering, autentisering og sanntidsdatasynkronisering. Støtter både offentlige og private tabeller i samme database.
 
 ---
 
-## Quick Start
+## Rask Start
 
-### 1. Build the Application
+### 1. Bygg Applikasjonen
 
 ```bash
 cd /path/to/tcpclusterd
 go build -o app
 ```
 
-### 2. Configure Your Cluster
-
-Create a `.env` file:
+### 2. Konfigurer (.env fil)
 
 ```bash
-# Single Server
+# Enkeltserver
 CLUSTER_PEERS=""
 
-# Or Multi-Server Cluster
+# Eller flerserver-klynge
 CLUSTER_PEERS="[fd00:250:250:d:1::aaaa]:5000,[fd00:250:250:d:1::aaab]:5000"
 
-# Other settings
-ADMIN_PASSWORD="your-secure-password"
-RUNTIME_PATH="runtime"
-PERSISTENT_BACKUP_PATH="backups"
-LOG_LEVEL="info"
-REPLICATION_TOKEN="your-secret-replication-token"
+# Andre innstillinger
+ADMIN_PASSWORD="ditt-sikre-passord"
+AES_KEY="32-tegns-krypteringsnøkkel-her"
+REPLICATION_TOKEN="hemmelig-replikeringstoken"
 TOKEN_TTL_SECONDS="3600"
-AES_KEY="your-aes-encryption-key-32-chars"
 ```
 
-### 3. Start the Server
+### 3. Start Serveren
 
 ```bash
 ./app
 ```
 
-The server starts a Unix socket at `/tmp/tcpclusterd.sock` for CLI commands.
+Serveren starter med Unix socket på `/tmp/tcpclusterd.sock` for CLI-kommandoer.
+
+**VIKTIG**: HTTP/TCP/WebSocket-tjenester må konfigureres via CLI for å være tilgjengelige. Se "Service Configuration" nedenfor.
 
 ---
 
-## CLI Commands
+## Service Configuration
 
-All commands communicate with the running server via Unix socket. **The server must be running in another terminal.**
-
-### User Management
+Serveren starter i "socket-only" modus. For å aktivere HTTP API:
 
 ```bash
-# Add a new user (creates personal database)
-./app --add john --password securepass123
+# Aktiver HTTP service på port 9090
+./app --config-http "enabled=true port=9090 host=0.0.0.0"
 
-# List all users
+# Sjekk service status
+./app --list-services
+```
+
+For WebSocket:
+```bash
+./app --config-ws "enabled=true port=8080 host=0.0.0.0"
+```
+
+---
+
+## CLI-Kommandoer
+
+Alle kommandoer kommuniserer med kjørende server via Unix socket.
+
+### Brukeradministrasjon
+
+```bash
+# Legg til ny bruker
+./app --add brukernavn --password passord123
+
+# List alle brukere
 ./app --listusers
 
-# Flush all authentication tokens
+# Fjern bruker
+./app --remove brukernavn
+
+# Tøm alle autentiseringstokens
 ./app --flushtokens
 ```
 
-### Database Operations
+### Databaseoperasjoner
 
 ```bash
-# Export all data to JSON
+# Eksporter alle data til JSON
 ./app --export
 
-# Export specific database
-./app --export mydb
+# Eksporter spesifikk database
+./app --export mindb
 
-# Import data from JSON file (append mode)
+# Importer data fra JSON-fil
 ./app --import data.json
 
-# Import and clear existing data first (replace mode)
+# Importer og slett eksisterende data først
 ./app --import data.json --clear
 ```
 
-### Cluster Management
+### Klyngestyring
 
 ```bash
-# Show all configured cluster peers
+# Vis konfigurerte klyngenoder
 ./app --list-cluster
 
-# Show peer connectivity metrics
+# Vis peer-metrikker
 ./app --peer-metrics
 
-# Show metrics for specific peer
+# Vis metrikker for spesifikk peer
 ./app --peer-metrics "[fd00:250:250:d:1::aaaa]:5000"
 ```
 
-### Runtime Management
+### Runtime-håndtering
 
 ```bash
-# Load database from last runtime snapshot
+# Last database fra siste runtime snapshot
 ./app --lastruntime
 
-# Export from last runtime and exit
+# Eksporter fra siste runtime og avslutt
 ./app --exportlastruntime
 
-# Load from persistent backup
+# Last fra persistent backup
 ./app --importpersistent
 
-# Clear old runtime folders
+# Slett gamle runtime-mapper
 ./app --clearruntimes
 ```
 
 ---
 
-## HTTP API Endpoints
+## HTTP API Endepunkter
 
-All endpoints require authentication. The server listens on the port configured for HTTP service (default: 9090).
+Alle endepunkter krever autentisering. Serveren lytter på konfigurert port (standard: 9090).
 
-### 1. Authentication
+### 1. Autentisering
 
-**Endpoint**: `POST /api/auth`
+**POST /api/auth**
 
-**Request**:
+**Forespørsel**:
 ```bash
 curl -X POST http://localhost:9090/api/auth \
   -H "Content-Type: application/json" \
   -d '{
-    "username": "john",
-    "password": "securepass123"
+    "username": "brukernavn",
+    "password": "passord123"
   }'
 ```
 
-**Response** (Success):
+**Svar (Suksess)**:
 ```json
 {
   "ok": true,
@@ -167,180 +154,208 @@ curl -X POST http://localhost:9090/api/auth \
 }
 ```
 
-**Response** (Failure):
-```json
-{
-  "ok": false,
-  "error": "invalid credentials"
-}
-```
-
-**Brute Force Protection**:
-- Max 20 attempts per IP per minute → HTTP 429
-- Max 8 attempts per user+IP per minute → HTTP 429
-- 5-minute temporary block on exceeded limits
+**Brute Force-beskyttelse**:
+- Maks 20 forsøk per IP per minutt → HTTP 429
+- Maks 8 forsøk per bruker+IP per minutt → HTTP 429
+- 5-minutters blokkering ved overskridelse
 
 ---
 
-### 2. Query Data
+### 2. Spørringer med SQL
 
-**Endpoint**: `POST /api/query`
+**POST /api/query** eller **POST /api/execute**
 
-**Request** (Query PUBLIC data):
+Endepunktet aksepterer SQL-lignende spørringer i JSON-format.
+
+#### SELECT - Hent data
+
 ```bash
 curl -X POST http://localhost:9090/api/query \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $TOKEN" \
   -d '{
-    "database": "agents",
-    "table": "agent_status",
-    "where": {}
+    "query": "SELECT * FROM mindb.public_tabell WHERE status = '\''online'\''"
   }'
 ```
 
-**Response**:
+**Med PRIVATE scope** (kun admin):
+```bash
+curl -X POST http://localhost:9090/api/query \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d '{
+    "query": "SELECT PRIVATE * FROM mindb.private_tabell WHERE id = '\''123'\''"
+  }'
+```
+
+#### INSERT - Sett inn data
+
+```bash
+curl -X POST http://localhost:9090/api/query \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{
+    "query": "INSERT PUBLIC INTO mindb.agents (agent_id, name, status) VALUES ('\''agent_001'\'', '\''John Smith'\'', '\''online'\'')"
+  }'
+```
+
+**INSERT PRIVATE** (kun admin):
+```bash
+curl -X POST http://localhost:9090/api/query \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d '{
+    "query": "INSERT PRIVATE INTO mindb.credentials (agent_id, phone) VALUES ('\''agent_001'\'', '\''+47-555-1234'\'')"
+  }'
+```
+
+#### UPDATE - Oppdater data
+
+```bash
+curl -X POST http://localhost:9090/api/query \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{
+    "query": "UPDATE PUBLIC mindb.agents SET status = '\''offline'\'' WHERE agent_id = '\''agent_001'\''"
+  }'
+```
+
+#### DELETE - Slett data
+
+```bash
+curl -X POST http://localhost:9090/api/query \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{
+    "query": "DELETE PUBLIC FROM mindb.agents WHERE agent_id = '\''agent_001'\''"
+  }'
+```
+
+#### UPSERT - Sett inn eller oppdater
+
+```bash
+curl -X POST http://localhost:9090/api/query \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{
+    "query": "UPSERT PUBLIC INTO mindb.agents (agent_id, status) VALUES ('\''agent_001'\'', '\''online'\'')"
+  }'
+```
+
+**Merk**: UPSERT oppdaterer rad hvis den finnes, ellers setter den inn ny rad.
+
+---
+
+### 3. JSON Import (uten SQL-escaping)
+
+**POST /api/import**
+
+For direkte JSON-import uten SQL-formatering:
+
+```bash
+curl -X POST http://localhost:9090/api/import \
+  -H "Content-Type: application/json" \
+  -d '{
+    "username": "brukernavn",
+    "password": "passord",
+    "database": "mindb",
+    "table": "agents",
+    "private": false,
+    "data": [
+      {"agent_id": "001", "name": "John", "status": "online"},
+      {"agent_id": "002", "name": "Jane", "status": "offline"}
+    ]
+  }'
+```
+
+**Data-felt** kan være:
+- Et enkelt objekt: `{"id": "1", "name": "Test"}`
+- En array av objekter: `[{...}, {...}]`
+- En JSON-streng: `"[{\"id\":\"1\"}]"`
+
+---
+
+### 4. Database Status
+
+**GET /api/status**
+
+```bash
+curl http://localhost:9090/api/status
+```
+
+**Svar**:
 ```json
 {
   "ok": true,
-  "data": [
-    {
-      "agent_id": "agent_001",
-      "agent_name": "John Smith",
-      "status": "online"
-    },
-    {
-      "agent_id": "agent_002",
-      "agent_name": "Jane Doe",
-      "status": "offline"
-    }
-  ]
+  "databases": ["system", "mindb"],
+  "peers": ["[fd00:250:250:d:1::aaaa]:5000"]
 }
 ```
 
-**Query with Filters**:
-```bash
-curl -X POST http://localhost:9090/api/query \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $TOKEN" \
-  -d '{
-    "database": "agents",
-    "table": "agent_status",
-    "where": {
-      "status": "online"
-    }
-  }'
-```
+---
 
-**Query PRIVATE data** (admin only):
+### 5. Offentlig Database-data
+
+**GET /api/databases/{database}**
+
+Henter alle offentlige tabeller for en database:
+
 ```bash
-curl -X POST http://localhost:9090/api/query \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -d '{
-    "database": "agents",
-    "table": "agent_credentials",
-    "is_private": true,
-    "where": {
-      "agent_id": "agent_001"
-    }
-  }'
+curl http://localhost:9090/api/databases/mindb
 ```
 
 ---
 
-### 3. Insert Data
+### 6. Health Check
 
-**Endpoint**: `POST /api/write`
+**GET /health**
 
-**Insert PUBLIC data**:
 ```bash
-curl -X POST http://localhost:9090/api/write \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $TOKEN" \
-  -d '{
-    "database": "agents",
-    "table": "agent_status",
-    "operation": "insert",
-    "data": {
-      "agent_id": "agent_003",
-      "agent_name": "Bob Johnson",
-      "status": "online"
-    }
-  }'
+curl http://localhost:9090/health
 ```
 
-**Insert PRIVATE data** (admin only):
-```bash
-curl -X POST http://localhost:9090/api/write \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -d '{
-    "database": "agents",
-    "table": "agent_credentials",
-    "operation": "insert",
-    "is_private": true,
-    "data": {
-      "agent_id": "agent_003",
-      "phone_number": "+47-555-9999",
-      "real_phone": "91234567"
-    }
-  }'
+**Svar**:
+```json
+{
+  "ok": true,
+  "status": "healthy"
+}
 ```
 
 ---
 
-### 4. Update Data
+## SQL-Syntaks
 
-**Endpoint**: `POST /api/write`
+### Støttede kommandoer
 
-**Update agent status**:
-```bash
-curl -X POST http://localhost:9090/api/write \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $TOKEN" \
-  -d '{
-    "database": "agents",
-    "table": "agent_status",
-    "operation": "update",
-    "data": {
-      "status": "offline",
-      "updated_at": 1772824145
-    },
-    "where": {
-      "agent_id": "agent_001"
-    }
-  }'
+- **SELECT** - Hent data fra tabell
+- **INSERT** - Sett inn ny rad
+- **UPDATE** - Oppdater eksisterende rader
+- **DELETE** - Slett rader
+- **UPSERT** - Sett inn eller oppdater
+
+### Scope (PUBLIC/PRIVATE)
+
+```sql
+-- PUBLIC (standard, alle autentiserte brukere)
+INSERT PUBLIC INTO db.table (col1, col2) VALUES ('val1', 'val2')
+SELECT * FROM db.table WHERE col = 'value'
+
+-- PRIVATE (kun admin)
+INSERT PRIVATE INTO db.table (secret) VALUES ('hemmelig')
+SELECT PRIVATE * FROM db.table WHERE id = '123'
+```
+
+Hvis `PUBLIC`/`PRIVATE` ikke spesifiseres, brukes `PRIVATE` som standard.
+
+### WHERE-betingelser
+
+```sql
+SELECT * FROM db.table WHERE status = 'online'
+SELECT * FROM db.table WHERE id = '123' AND active = 'true'
+DELETE FROM db.table WHERE timestamp < '1672531200'
 ```
 
 ---
 
-### 5. Delete Data
+## Systemtabeller
 
-**Endpoint**: `POST /api/write`
-
-**Delete agent record**:
-```bash
-curl -X POST http://localhost:9090/api/write \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -d '{
-    "database": "agents",
-    "table": "agent_status",
-    "operation": "delete",
-    "where": {
-      "agent_id": "agent_001"
-    }
-  }'
-```
-
----
-
-## Database Schema
-
-### System Tables (Automatic)
-
-#### `system.users`
-Stores user accounts and credentials (private).
+### system.users
+Brukerkontoer og legitimasjon (privat).
 
 ```json
 {
@@ -352,8 +367,8 @@ Stores user accounts and credentials (private).
 }
 ```
 
-#### `system.tokens`
-Stores authentication tokens with expiration (private).
+### system.tokens
+Autentiseringstokens med utløp (privat).
 
 ```json
 {
@@ -365,8 +380,8 @@ Stores authentication tokens with expiration (private).
 }
 ```
 
-#### `system.auth_rate_limits`
-Tracks failed authentication attempts (distributed across cluster).
+### system.auth_rate_limits
+Sporings av mislykkede autentiseringsforsøk (distribuert).
 
 ```json
 {
@@ -378,8 +393,8 @@ Tracks failed authentication attempts (distributed across cluster).
 }
 ```
 
-#### `system.peer_metrics`
-Cluster node status and replication statistics (public).
+### system.peer_metrics
+Klyngenodestatus og replikeringsstatistikk (offentlig).
 
 ```json
 {
@@ -388,15 +403,75 @@ Cluster node status and replication statistics (public).
   "last_ping": 1772824145,
   "replication_failures": 0,
   "replication_lag_ms": 45,
-  "writes_replicated": 1523,
-  "created_at": 1772814834,
-  "updated_at": 1772824145
+  "writes_replicated": 1523
+}
+```
+
+### system.services_config
+Tjenesteinnstillinger (HTTP/TCP/WebSocket).
+
+```json
+{
+  "service": "http",
+  "enabled": true,
+  "host": "0.0.0.0",
+  "port": 9090,
+  "tls": false
 }
 ```
 
 ---
 
-## Real-World Example: Agent Status Website
+## Brukseksempel: Agent Status-system
+
+### Problem
+En kundeservice-nettside som viser agentstatus:
+- **Offentlige data**: Agent ID, Navn, Status (Online/Offline)
+- **Private data**: Telefonnummer, E-post, Passord
+
+### Løsning
+
+**Opprett offentlig tabell** (alle kan lese):
+```bash
+curl -X POST http://localhost:9090/api/query \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{
+    "query": "INSERT PUBLIC INTO agents.status (agent_id, name, status) VALUES ('\''001'\'', '\''John'\'', '\''online'\'')"
+  }'
+```
+
+**Opprett privat tabell** (kun admin):
+```bash
+curl -X POST http://localhost:9090/api/query \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d '{
+    "query": "INSERT PRIVATE INTO agents.credentials (agent_id, phone, email) VALUES ('\''001'\'', '\''+47-555-1234'\'', '\''john@example.com'\'')"
+  }'
+```
+
+**Kunder henter status** (offentlig):
+```bash
+curl -X POST http://localhost:9090/api/query \
+  -H "Authorization: Bearer $CUSTOMER_TOKEN" \
+  -d '{
+    "query": "SELECT * FROM agents.status WHERE status = '\''online'\''"
+  }'
+# Returnerer: agent_id, name, status (ikke telefon/e-post)
+```
+
+**Admin henter private data**:
+```bash
+curl -X POST http://localhost:9090/api/query \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d '{
+    "query": "SELECT PRIVATE * FROM agents.credentials WHERE agent_id = '\''001'\''"
+  }'
+# Returnerer: agent_id, phone, email
+```
+
+---
+
+## Klyngeoppsett
 
 ### Scenario
 You're running a call center and need a website where customers can see if agents are available.
@@ -497,74 +572,83 @@ curl -X POST http://localhost:9090/api/query \
 # agent_id, phone_number, email
 ```
 
----
 
-## Cluster Deployment
-
-### Multi-Server Setup
+### Flerserver-oppsett
 
 **Node 1** (`[fd00:250:250:d:1::aaaa]:5000`):
 ```bash
+# .env
 CLUSTER_PEERS="[fd00:250:250:d:1::aaaa]:5000,[fd00:250:250:d:1::aaab]:5000"
+
+# Start server
 ./app
+
+# Aktiver HTTP service
+./app --config-http "enabled=true port=9090 host=0.0.0.0"
 ```
 
 **Node 2** (`[fd00:250:250:d:1::aaab]:5000`):
 ```bash
+# .env
 CLUSTER_PEERS="[fd00:250:250:d:1::aaaa]:5000,[fd00:250:250:d:1::aaab]:5000"
+
+# Start server
 ./app
+
+# Aktiver HTTP service
+./app --config-http "enabled=true port=9090 host=0.0.0.0"
 ```
 
-**Automatic behavior**:
-- All writes are replicated to all nodes
-- If one node is down, queries still work (eventual consistency)
-- When node comes back online, it syncs automatically
-- Replication is idempotent (no duplicate data)
+**Automatisk oppførsel**:
+- Alle skriveoperasjoner replikeres til alle noder
+- Hvis en node er nede, fungerer spørringer fortsatt (eventual consistency)
+- Når noden kommer tilbake, synkroniserer den automatisk
+- Replikering er idempotent (ingen duplikate data)
 
-### Check Cluster Status
+### Sjekk klyngestatus
 
 ```bash
 ./app --peer-metrics
 
-# Output shows:
-# - Which peers are online
-# - Last ping time
-# - Replication lag
-# - Number of replicated writes
+# Viser:
+# - Hvilke peers som er online
+# - Siste ping-tid
+# - Replikeringsforsinkelse
+# - Antall replikerte skriveoperasjoner
 ```
 
 ---
 
-## Security Features
+## Sikkerhetsfunksjoner
 
-### 1. Authentication
-- Username/password with bcrypt hashing
-- One-time tokens (JWT with AES encryption)
-- Token TTL (configurable via `TOKEN_TTL_SECONDS`)
-- Automatic token cleanup (expired tokens deleted)
+### 1. Autentisering
+- Brukernavn/passord med bcrypt-hashing
+- Engangstokens (JWT med AES-kryptering)
+- Token TTL (konfigurerbar via `TOKEN_TTL_SECONDS`)
+- Automatisk token-opprydding (utløpte tokens slettes)
 
-### 2. Brute Force Protection
-- Per-IP rate limiting: max 20 attempts/minute
-- Per-user+IP rate limiting: max 8 attempts/minute
-- Automatic 5-minute block on exceeded limits
-- Rate limit state replicated across cluster
+### 2. Brute Force-beskyttelse
+- Per-IP begrensning: maks 20 forsøk/minutt
+- Per-bruker+IP begrensning: maks 8 forsøk/minutt
+- Automatisk 5-minutters blokkering ved overskridelse
+- Rate limit-tilstand replikert på tvers av klyngen
 
-### 3. Replication Security
-- Replication token authentication (`X-Replication-Token` header)
-- Request body size limits (1 MiB per request)
-- Idempotent writes (prevents duplicate applies)
-- Constant-time comparison for tokens
+### 3. Replikeringssikkerhet
+- Replikeringstoken-autentisering (`X-Replication-Token` header)
+- Forespørselsgrenser (1 MiB per forespørsel)
+- Idempotente skriveoperasjoner (forhindrer duplikatanvendelse)
+- Constant-time sammenligning for tokens
 
-### 4. Data Privacy
-- Private tables hidden from non-admin queries
-- Admin-only access to sensitive data
-- Separate authentication per user
+### 4. Dataprivacy
+- Private tabeller skjult fra ikke-admin spørringer
+- Kun admin-tilgang til sensitive data
+- Separat autentisering per bruker
 
 ---
 
-## Troubleshooting
+## Feilsøking
 
-### Import times out during network issues
+### Import timeout ved nettverksproblemer
 
 ```
 [ERROR] import failed: cluster write timed out - check if all nodes are online 
@@ -572,54 +656,66 @@ and network connectivity is available. I did a ping test to 8.8.8.8 (OK) and
 [2001:4860:4860::8888] (TIMEOUT)
 ```
 
-**Solution**: Check network connectivity. If IPv6 is down, ensure all nodes are IPv4 accessible, or configure IPv6 properly.
+**Løsning**: Sjekk nettverkstilkobling. Hvis IPv6 er nede, sørg for at alle noder er IPv4-tilgjengelige, eller konfigurer IPv6 korrekt.
 
-### Peer metrics show duplicates or ephemeral ports
+### Peer-metrikker viser duplikater eller ephemeral porter
 
-**Cause**: Inbound connections are creating temporary entries with dynamic ports.
+**Årsak**: Innkommende tilkoblinger oppretter midlertidige oppføringer med dynamiske porter.
 
-**Solution**: Peers shown are automatically filtered to only configured peers in `CLUSTER_PEERS`. Ephemeral entries are hidden.
+**Løsning**: Viste peers filtreres automatisk til kun konfigurerte peers i `CLUSTER_PEERS`. Ephemeral oppføringer skjules.
 
-### Slow replication
+### Treg replikering
 
 ```bash
 ./app --peer-metrics
 ```
 
-Check `replication_lag_ms`. If high (>500ms):
-- Check network bandwidth
-- Check disk I/O on target nodes
-- Ensure all nodes are healthy
+Sjekk `replication_lag_ms`. Hvis høy (>500ms):
+- Sjekk nettverksbåndbredde
+- Sjekk disk I/O på målnoder
+- Sørg for at alle noder er friske
+
+### HTTP service ikke tilgjengelig
+
+**Problem**: `curl: (7) Failed to connect to localhost port 9090`
+
+**Løsning**: HTTP service må aktiveres eksplisitt:
+```bash
+./app --config-http "enabled=true port=9090 host=0.0.0.0"
+
+# Verifiser
+./app --list-services
+```
 
 ---
 
-## Performance
+## Ytelse
 
-- **Single node**: ~10,000 queries/second
-- **Cluster write**: 5-10 second timeout per write (configurable)
-- **Replication**: Sub-second to peers on same network
-- **Memory**: ~100 MB base + data size
+- **Enkeltnode**: ~10,000 spørringer/sekund
+- **Klyngeskriving**: 5-10 sekunders timeout per skriving (konfigurerbar)
+- **Replikering**: Sub-sekund til peers på samme nettverk
+- **Minne**: ~100 MB base + datastørrelse
 
 ---
 
-## Backup & Recovery
+## Backup og Gjenoppretting
 
-### Automatic Backups
+### Automatiske backups
 
-Backups are created in `backups/` folder:
+Backups opprettes i `backups/`-mappen:
 ```bash
 ls backups/
 backup_2026-03-06_19-23-45.json
 backup_2026-03-06_19-13-45.json
 ```
 
-### Manual Backup
+### Manuell backup
 
 ```bash
 ./app --export > backup_manual.json
 ```
 
-### Restore from Backup
+### Gjenopprett fra backup
 
 ```bash
 ./app --import backup_manual.json --clear
@@ -627,31 +723,32 @@ backup_2026-03-06_19-13-45.json
 
 ---
 
-## Configuration Reference
+## Konfigurasjonsreferanse
 
-| Variable | Default | Description |
+| Variabel | Standard | Beskrivelse |
 |----------|---------|-------------|
-| `CLUSTER_PEERS` | "" | Comma-separated cluster peer addresses |
-| `ADMIN_PASSWORD` | "admin" | Admin user password |
-| `RUNTIME_PATH` | "runtime" | Directory for runtime snapshots |
-| `PERSISTENT_BACKUP_PATH` | "backups" | Directory for backups |
-| `LOG_LEVEL` | "info" | Log verbosity (debug, info, warn, error) |
-| `REPLICATION_TOKEN` | "" | Secret token for cluster replication |
-| `TOKEN_TTL_SECONDS` | "" | Auth token expiration (empty = no expiration) |
-| `AES_KEY` | "default-secret..." | Encryption key for tokens (32 chars) |
-| `AUTO_BACKUP` | "true" | Enable automatic backups |
-| `AUTO_CLEAR_RUNTIMES` | "false" | Auto-delete old runtime snapshots |
+| `CLUSTER_PEERS` | "" | Kommaseparerte klynge peer-adresser |
+| `ADMIN_PASSWORD` | "admin" | Admin-brukerpassord |
+| `RUNTIME_PATH` | "runtime" | Katalog for runtime snapshots |
+| `PERSISTENT_BACKUP_PATH` | "backups" | Katalog for backups |
+| `LOG_LEVEL` | "info" | Loggingsnivå (debug, info, warn, error) |
+| `REPLICATION_TOKEN` | "" | Hemmelig token for klyngereplikering |
+| `TOKEN_TTL_SECONDS` | "" | Auth token-utløp (tom = ingen utløp) |
+| `AES_KEY` | "default-secret..." | Krypteringsnøkkel for tokens (32 tegn) |
+| `AUTO_BACKUP` | "true" | Aktiver automatiske backups |
+| `AUTO_CLEAR_RUNTIMES` | "false" | Auto-slett gamle runtime snapshots |
 
 ---
 
-## Summary
+## Oppsummering
 
-tcpclusterd provides:
-✓ **Public + Private Data** in one database  
-✓ **Real-time Cluster Replication** across multiple nodes  
-✓ **Authentication & Authorization** with rate limiting  
-✓ **Security** with token encryption and brute-force protection  
-✓ **Automatic Failover** when nodes go down  
-✓ **Simple REST API** for queries and writes  
+tcpclusterd tilbyr:
 
-Perfect for systems that need to expose some data (agent status) while protecting other data (phone numbers, passwords, internal IDs).
+✓ **Offentlige + Private data** i samme database  
+✓ **Sanntids klyngereplikering** på tvers av flere noder  
+✓ **Autentisering og autorisasjon** med rate limiting  
+✓ **Sikkerhet** med token-kryptering og brute-force beskyttelse  
+✓ **Automatisk failover** når noder går ned  
+✓ **Enkel REST API** med SQL-lignende spørrespråk  
+
+Perfekt for systemer som trenger å eksponere noe data (agentstatus) mens andre data beskyttes (telefonnumre, passord, interne IDer).
