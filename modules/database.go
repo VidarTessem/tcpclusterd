@@ -1,12 +1,16 @@
 package modules
 
 import (
+	"bytes"
+	"compress/gzip"
 	"crypto/sha512"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -25,6 +29,24 @@ type Database struct {
 	autoBackupEnabled    bool
 	writeJournal         []*WriteJournalEntry // Track all writes for replication
 	journalMu            sync.RWMutex
+	lastRuntimeCleanup   time.Time
+}
+
+const (
+	runtimeSnapshotFormatTokenizedV1 = "tokenized-v1"
+	runtimeRetentionDaysDefault      = 30
+)
+
+type tokenDictionary struct {
+	tokens []string
+	index  map[string]int
+}
+
+type tokenizedRuntimeSnapshot struct {
+	Format    string      `json:"format"`
+	Timestamp interface{} `json:"timestamp,omitempty"`
+	Tokens    []string    `json:"tokens"`
+	Payload   interface{} `json:"payload"`
 }
 
 // WriteJournalEntry represents a single write operation in the journal
@@ -804,12 +826,17 @@ func (db *Database) ImportFromJSON(data []byte) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
+	decodedData, err := decodeRuntimeStorageBytes(data)
+	if err != nil {
+		return err
+	}
+
 	var importData struct {
 		Databases map[string]*DatabaseInstance `json:"databases"`
 		Users     map[string]*User             `json:"users"` // Legacy field, ignored
 	}
 
-	if err := json.Unmarshal(data, &importData); err != nil {
+	if err := json.Unmarshal(decodedData, &importData); err != nil {
 		return fmt.Errorf("failed to unmarshal JSON: %w", err)
 	}
 
@@ -849,9 +876,9 @@ func (db *Database) ImportFromJSON(data []byte) error {
 
 // SaveRuntimeSnapshot saves a snapshot of the database to the runtime folder
 func (db *Database) SaveRuntimeSnapshot() error {
-	jsonData, err := db.ExportToJSON()
+	runtimeBytes, err := db.exportRuntimeSnapshotBytes()
 	if err != nil {
-		return fmt.Errorf("failed to export data: %w", err)
+		return err
 	}
 
 	if db.runtimePath == "" {
@@ -865,8 +892,13 @@ func (db *Database) SaveRuntimeSnapshot() error {
 
 	// Save to database.json
 	dbFilePath := filepath.Join(db.runtimePath, "database.json")
-	if err := os.WriteFile(dbFilePath, jsonData, 0644); err != nil {
+	if err := os.WriteFile(dbFilePath, runtimeBytes, 0644); err != nil {
 		return fmt.Errorf("failed to write database file: %w", err)
+	}
+
+	gzipBytes, err := gzipData(runtimeBytes)
+	if err == nil {
+		_ = os.WriteFile(filepath.Join(db.runtimePath, "database.json.gz"), gzipBytes, 0644)
 	}
 
 	// Also save to persistent backup if enabled
@@ -877,9 +909,16 @@ func (db *Database) SaveRuntimeSnapshot() error {
 
 		timestamp := time.Now().Format("2006-01-02_15-04-05")
 		backupPath := filepath.Join(db.persistentBackupPath, fmt.Sprintf("backup_%s.json", timestamp))
-		if err := os.WriteFile(backupPath, jsonData, 0644); err != nil {
+		if err := os.WriteFile(backupPath, runtimeBytes, 0644); err != nil {
 			return fmt.Errorf("failed to write backup file: %w", err)
 		}
+		if len(gzipBytes) > 0 {
+			_ = os.WriteFile(filepath.Join(db.persistentBackupPath, fmt.Sprintf("backup_%s.json.gz", timestamp)), gzipBytes, 0644)
+		}
+	}
+
+	if err := db.cleanupRuntimeRetention(runtimeRetentionDaysDefault); err != nil {
+		return err
 	}
 
 	return nil
@@ -891,17 +930,316 @@ func (db *Database) LoadRuntimeSnapshot() error {
 		return nil // No runtime path set, start blank
 	}
 
-	dbFilePath := filepath.Join(db.runtimePath, "database.json")
-	if _, err := os.Stat(dbFilePath); os.IsNotExist(err) {
-		return nil // No runtime file exists, start blank
-	}
+	dbGzipPath := filepath.Join(db.runtimePath, "database.json.gz")
+	dbJSONPath := filepath.Join(db.runtimePath, "database.json")
 
-	jsonData, err := os.ReadFile(dbFilePath)
-	if err != nil {
-		return fmt.Errorf("failed to read database file: %w", err)
+	var jsonData []byte
+	if _, err := os.Stat(dbGzipPath); err == nil {
+		compressed, readErr := os.ReadFile(dbGzipPath)
+		if readErr != nil {
+			return fmt.Errorf("failed to read gzip database file: %w", readErr)
+		}
+		decoded, decodeErr := gunzipData(compressed)
+		if decodeErr != nil {
+			return fmt.Errorf("failed to decode gzip database file: %w", decodeErr)
+		}
+		jsonData = decoded
+	} else {
+		if _, statErr := os.Stat(dbJSONPath); os.IsNotExist(statErr) {
+			return nil // No runtime file exists, start blank
+		}
+		readJSON, readErr := os.ReadFile(dbJSONPath)
+		if readErr != nil {
+			return fmt.Errorf("failed to read database file: %w", readErr)
+		}
+		jsonData = readJSON
 	}
 
 	return db.ImportFromJSON(jsonData)
+}
+
+func (db *Database) exportRuntimeSnapshotBytes() ([]byte, error) {
+	rawJSON, err := db.ExportToJSON()
+	if err != nil {
+		return nil, fmt.Errorf("failed to export data: %w", err)
+	}
+
+	tokenized, tokErr := encodeTokenizedRuntimePayload(rawJSON)
+	if tokErr == nil {
+		return tokenized, nil
+	}
+
+	var compact interface{}
+	if err := json.Unmarshal(rawJSON, &compact); err != nil {
+		return rawJSON, nil
+	}
+	compactBytes, err := json.Marshal(compact)
+	if err != nil {
+		return rawJSON, nil
+	}
+	return compactBytes, nil
+}
+
+func (db *Database) cleanupRuntimeRetention(days int) error {
+	if days <= 0 || db.runtimePath == "" {
+		return nil
+	}
+
+	now := time.Now()
+	db.mu.Lock()
+	if !db.lastRuntimeCleanup.IsZero() && now.Sub(db.lastRuntimeCleanup) < time.Hour {
+		db.mu.Unlock()
+		return nil
+	}
+	db.lastRuntimeCleanup = now
+	db.mu.Unlock()
+
+	runtimeBase := filepath.Dir(db.runtimePath)
+	entries, err := os.ReadDir(runtimeBase)
+	if err != nil {
+		return nil
+	}
+
+	currentAbs, _ := filepath.Abs(filepath.Clean(db.runtimePath))
+	maxAge := time.Duration(days) * 24 * time.Hour
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		folderName := strings.TrimSpace(entry.Name())
+		parsedTime, parseErr := time.Parse("2006-01-02_15-04-05", folderName)
+		if parseErr != nil {
+			continue
+		}
+		if now.Sub(parsedTime) <= maxAge {
+			continue
+		}
+		path := filepath.Join(runtimeBase, folderName)
+		candidateAbs, _ := filepath.Abs(filepath.Clean(path))
+		if currentAbs != "" && candidateAbs == currentAbs {
+			continue
+		}
+		_ = os.RemoveAll(path)
+	}
+	return nil
+}
+
+func encodeTokenizedRuntimePayload(rawJSON []byte) ([]byte, error) {
+	var root interface{}
+	if err := json.Unmarshal(rawJSON, &root); err != nil {
+		return nil, fmt.Errorf("failed to parse export json: %w", err)
+	}
+
+	dict := &tokenDictionary{index: make(map[string]int)}
+	encoded := tokenizeNode(root, dict)
+	container := tokenizedRuntimeSnapshot{
+		Format:  runtimeSnapshotFormatTokenizedV1,
+		Tokens:  dict.tokens,
+		Payload: encoded,
+	}
+	if rootMap, ok := root.(map[string]interface{}); ok {
+		if ts, exists := rootMap["timestamp"]; exists {
+			container.Timestamp = ts
+		}
+	}
+
+	return json.Marshal(container)
+}
+
+func decodeRuntimeStorageBytes(data []byte) ([]byte, error) {
+	plain := data
+	if isGzipPayload(data) {
+		decoded, err := gunzipData(data)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode gzip payload: %w", err)
+		}
+		plain = decoded
+	}
+
+	var probe map[string]interface{}
+	if err := json.Unmarshal(plain, &probe); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal JSON: %w", err)
+	}
+	format := strings.TrimSpace(fmt.Sprint(probe["format"]))
+	if format != runtimeSnapshotFormatTokenizedV1 {
+		return plain, nil
+	}
+
+	container := tokenizedRuntimeSnapshot{}
+	if err := json.Unmarshal(plain, &container); err != nil {
+		return nil, fmt.Errorf("failed to parse tokenized payload: %w", err)
+	}
+	decodedPayload, err := detokenizeNode(container.Payload, container.Tokens, map[string]string{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode tokenized payload: %w", err)
+	}
+
+	decodedMap, ok := decodedPayload.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("decoded payload has invalid root type")
+	}
+	if container.Timestamp != nil {
+		if _, exists := decodedMap["timestamp"]; !exists {
+			decodedMap["timestamp"] = container.Timestamp
+		}
+	}
+
+	return json.Marshal(decodedMap)
+}
+
+func tokenizeNode(value interface{}, dict *tokenDictionary) interface{} {
+	switch typed := value.(type) {
+	case string:
+		return map[string]interface{}{"$t": dict.tokenIndex(typed)}
+	case []interface{}:
+		items := make([]interface{}, 0, len(typed))
+		for _, item := range typed {
+			items = append(items, tokenizeNode(item, dict))
+		}
+		return map[string]interface{}{"$a": items}
+	case map[string]interface{}:
+		keys := make([]string, 0, len(typed))
+		for key := range typed {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		pairs := make([]interface{}, 0, len(keys))
+		for _, key := range keys {
+			pairs = append(pairs, []interface{}{dict.tokenIndex(key), tokenizeNode(typed[key], dict)})
+		}
+		return map[string]interface{}{"$o": pairs}
+	default:
+		return value
+	}
+}
+
+func detokenizeNode(value interface{}, tokens []string, interner map[string]string) (interface{}, error) {
+	switch typed := value.(type) {
+	case map[string]interface{}:
+		if tokenRef, ok := typed["$t"]; ok && len(typed) == 1 {
+			idx, err := tokenRefIndex(tokenRef)
+			if err != nil {
+				return nil, err
+			}
+			if idx < 0 || idx >= len(tokens) {
+				return nil, fmt.Errorf("token index out of range: %d", idx)
+			}
+			return internString(tokens[idx], interner), nil
+		}
+		if arrNode, ok := typed["$a"]; ok && len(typed) == 1 {
+			arr, _ := arrNode.([]interface{})
+			result := make([]interface{}, 0, len(arr))
+			for _, item := range arr {
+				decoded, err := detokenizeNode(item, tokens, interner)
+				if err != nil {
+					return nil, err
+				}
+				result = append(result, decoded)
+			}
+			return result, nil
+		}
+		if objNode, ok := typed["$o"]; ok && len(typed) == 1 {
+			rows, _ := objNode.([]interface{})
+			result := make(map[string]interface{}, len(rows))
+			for _, row := range rows {
+				pair, _ := row.([]interface{})
+				if len(pair) != 2 {
+					return nil, fmt.Errorf("invalid object pair encoding")
+				}
+				keyIndex, err := tokenRefIndex(pair[0])
+				if err != nil {
+					return nil, err
+				}
+				if keyIndex < 0 || keyIndex >= len(tokens) {
+					return nil, fmt.Errorf("object key token index out of range: %d", keyIndex)
+				}
+				decoded, err := detokenizeNode(pair[1], tokens, interner)
+				if err != nil {
+					return nil, err
+				}
+				result[internString(tokens[keyIndex], interner)] = decoded
+			}
+			return result, nil
+		}
+		fallback := make(map[string]interface{}, len(typed))
+		for key, raw := range typed {
+			decoded, err := detokenizeNode(raw, tokens, interner)
+			if err != nil {
+				return nil, err
+			}
+			fallback[internString(key, interner)] = decoded
+		}
+		return fallback, nil
+	case []interface{}:
+		result := make([]interface{}, 0, len(typed))
+		for _, item := range typed {
+			decoded, err := detokenizeNode(item, tokens, interner)
+			if err != nil {
+				return nil, err
+			}
+			result = append(result, decoded)
+		}
+		return result, nil
+	default:
+		return value, nil
+	}
+}
+
+func (d *tokenDictionary) tokenIndex(value string) int {
+	if idx, ok := d.index[value]; ok {
+		return idx
+	}
+	idx := len(d.tokens)
+	d.tokens = append(d.tokens, value)
+	d.index[value] = idx
+	return idx
+}
+
+func tokenRefIndex(value interface{}) (int, error) {
+	switch typed := value.(type) {
+	case float64:
+		return int(typed), nil
+	case int:
+		return typed, nil
+	case int64:
+		return int(typed), nil
+	default:
+		return 0, fmt.Errorf("invalid token index type %T", value)
+	}
+}
+
+func internString(value string, interner map[string]string) string {
+	if existing, ok := interner[value]; ok {
+		return existing
+	}
+	interner[value] = value
+	return value
+}
+
+func gzipData(data []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	writer := gzip.NewWriter(&buf)
+	if _, err := writer.Write(data); err != nil {
+		_ = writer.Close()
+		return nil, err
+	}
+	if err := writer.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func gunzipData(data []byte) ([]byte, error) {
+	reader, err := gzip.NewReader(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	defer reader.Close()
+	return io.ReadAll(reader)
+}
+
+func isGzipPayload(data []byte) bool {
+	return len(data) >= 2 && data[0] == 0x1f && data[1] == 0x8b
 }
 
 // GetAllDatabases returns all database names

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"crypto/rand"
 	"encoding/json"
 	"errors"
@@ -308,14 +309,34 @@ func clearOldRuntimes() {
 		return
 	}
 
+	retention := 30 * 24 * time.Hour
+	now := time.Now()
+	currentRuntimeAbs, _ := filepath.Abs(filepath.Clean(config.RuntimePath))
+
 	for _, entry := range entries {
-		if entry.IsDir() {
-			path := filepath.Join(runtimeBase, entry.Name())
-			if err := os.RemoveAll(path); err != nil {
-				log.Printf("Failed to remove runtime folder %s: %v", path, err)
-			} else {
-				log.Printf("Removed runtime folder: %s", path)
-			}
+		if !entry.IsDir() {
+			continue
+		}
+
+		folderName := strings.TrimSpace(entry.Name())
+		parsedTime, parseErr := time.Parse("2006-01-02_15-04-05", folderName)
+		if parseErr != nil {
+			continue
+		}
+		if now.Sub(parsedTime) <= retention {
+			continue
+		}
+
+		path := filepath.Join(runtimeBase, folderName)
+		pathAbs, _ := filepath.Abs(filepath.Clean(path))
+		if currentRuntimeAbs != "" && pathAbs == currentRuntimeAbs {
+			continue
+		}
+
+		if err := os.RemoveAll(path); err != nil {
+			log.Printf("Failed to remove runtime folder %s: %v", path, err)
+		} else {
+			log.Printf("Removed old runtime folder (>30d): %s", path)
 		}
 	}
 }
@@ -1004,23 +1025,13 @@ func executeSocketCommand(req SocketRequest) SocketResponse {
 	switch req.Command {
 	case "export":
 		dbname, _ := req.Data["dbname"].(string)
-		var data []byte
-		var err error
-
-		if dbname == "" {
-			// Export all databases
-			data, err = db.ExportToJSON()
-		} else {
-			// Export specific database
-			data, err = db.ExportToJSONDatabase(dbname)
-		}
-
+		exported, err := exportDatabaseJSON(dbname, true)
 		if err != nil {
 			return SocketResponse{Success: false, Message: err.Error()}
 		}
 		return SocketResponse{
 			Success: true,
-			Data:    map[string]interface{}{"json": string(data)},
+			Data:    map[string]interface{}{"json": exported},
 		}
 
 	case "listusers":
@@ -1215,6 +1226,110 @@ func executeSocketCommand(req SocketRequest) SocketResponse {
 
 	default:
 		return SocketResponse{Success: false, Message: "unknown command"}
+	}
+}
+
+func exportDatabaseJSON(dbname string, includeTokens bool) (string, error) {
+	var data []byte
+	var err error
+
+	if dbname == "" {
+		data, err = db.ExportToJSON()
+	} else {
+		data, err = db.ExportToJSONDatabase(dbname)
+	}
+	if err != nil {
+		return "", err
+	}
+
+	return sanitizeExportJSON(string(data), includeTokens)
+}
+
+func authenticateTCPToken(token string) (string, bool, string, error) {
+	if token == "" {
+		return "", false, "", fmt.Errorf("authentication required: call auth first, then include token")
+	}
+
+	username, isAdmin, err := tokenManager.ValidateToken(token)
+	if err != nil {
+		return "", false, "", fmt.Errorf("invalid token: %v", err)
+	}
+
+	if err := tokenManager.ConsumeToken(token); err != nil {
+		return "", false, "", fmt.Errorf("failed to consume token: %v", err)
+	}
+
+	nextToken, err := tokenManager.IssueToken(username, isAdmin)
+	if err != nil {
+		return "", false, "", fmt.Errorf("failed to issue next token: %v", err)
+	}
+
+	return username, isAdmin, nextToken, nil
+}
+
+func handleTCPSubscription(conn net.Conn, req SocketRequest) {
+	if req.Data == nil {
+		req.Data = map[string]interface{}{}
+	}
+
+	token, _ := req.Data["token"].(string)
+	_, _, nextToken, err := authenticateTCPToken(token)
+	if err != nil {
+		_ = json.NewEncoder(conn).Encode(SocketResponse{Success: false, Message: err.Error()})
+		return
+	}
+
+	intervalSeconds := 5
+	switch value := req.Data["interval_seconds"].(type) {
+	case float64:
+		intervalSeconds = int(value)
+	case int:
+		intervalSeconds = value
+	case string:
+		if parsed, parseErr := strconv.Atoi(strings.TrimSpace(value)); parseErr == nil {
+			intervalSeconds = parsed
+		}
+	}
+	if intervalSeconds <= 0 {
+		intervalSeconds = 5
+	}
+
+	dbname, _ := req.Data["dbname"].(string)
+	scope, _ := req.Data["scope"].(string)
+	includeTokens := strings.EqualFold(strings.TrimSpace(scope), "full")
+
+	encoder := json.NewEncoder(conn)
+	sendSnapshot := func(message string) error {
+		payload, exportErr := exportDatabaseJSON(dbname, includeTokens)
+		if exportErr != nil {
+			return encoder.Encode(SocketResponse{Success: false, Message: fmt.Sprintf("failed to export database: %v", exportErr)})
+		}
+
+		_ = conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+		return encoder.Encode(SocketResponse{
+			Success: true,
+			Message: message,
+			Data: map[string]interface{}{
+				"json":             payload,
+				"token":            nextToken,
+				"interval_seconds": intervalSeconds,
+			},
+		})
+	}
+
+	if err := sendSnapshot("subscription started"); err != nil {
+		log.Printf("Failed to write TCP subscription response: %v", err)
+		return
+	}
+
+	ticker := time.NewTicker(time.Duration(intervalSeconds) * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		if err := sendSnapshot("subscription update"); err != nil {
+			log.Printf("TCP subscription ended for %s: %v", conn.RemoteAddr(), err)
+			return
+		}
 	}
 }
 
@@ -1766,7 +1881,7 @@ func applyClusterWrite(operation string, data map[string]interface{}) error {
 		// Use shorter timeout for import operations
 		timeout := 10 * time.Second
 		if operation == "import" {
-			timeout = 5 * time.Second
+			timeout = 60 * time.Second
 		}
 		if err := peerServer.ReplicateWriteAndWait(writeOp, timeout); err != nil {
 			// Provide clearer error message for network issues
@@ -2113,44 +2228,77 @@ func startTCPService(cfg *modules.ServiceConfig) net.Listener {
 // handleTCPConnection handles incoming TCP connections
 func handleTCPConnection(conn net.Conn) {
 	defer conn.Close()
-	log.Printf("TCP connection from %s", conn.RemoteAddr())
-
-	_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-	payload, err := io.ReadAll(conn)
-	if err != nil {
-		resp := SocketResponse{Success: false, Message: fmt.Sprintf("failed to read request: %v", err)}
-		_ = json.NewEncoder(conn).Encode(resp)
-		return
+	if parseEnvBool(os.Getenv("TCP_LOG_CONNECTIONS"), false) {
+		log.Printf("TCP connection from %s", conn.RemoteAddr())
 	}
 
-	input := strings.TrimSpace(string(payload))
-	if input == "" {
-		resp := SocketResponse{Success: false, Message: "empty request"}
-		_ = json.NewEncoder(conn).Encode(resp)
-		return
-	}
+	reader := bufio.NewReader(conn)
+	encoder := json.NewEncoder(conn)
 
-	var req SocketRequest
-	if strings.HasPrefix(input, "{") {
-		if err := json.Unmarshal([]byte(input), &req); err != nil {
-			resp := SocketResponse{Success: false, Message: fmt.Sprintf("invalid json request: %v", err)}
-			_ = json.NewEncoder(conn).Encode(resp)
+	for {
+		_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				input := strings.TrimSpace(line)
+				if input == "" {
+					return
+				}
+				// Process last line below and then close.
+				line = input
+			} else {
+				_ = conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+				_ = encoder.Encode(SocketResponse{Success: false, Message: fmt.Sprintf("failed to read request: %v", err)})
+				return
+			}
+		}
+
+		input := strings.TrimSpace(line)
+		if input == "" {
+			if errors.Is(err, io.EOF) {
+				return
+			}
+			continue
+		}
+
+		var req SocketRequest
+		if strings.HasPrefix(input, "{") {
+			if unmarshalErr := json.Unmarshal([]byte(input), &req); unmarshalErr != nil {
+				_ = conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+				_ = encoder.Encode(SocketResponse{Success: false, Message: fmt.Sprintf("invalid json request: %v", unmarshalErr)})
+				if errors.Is(err, io.EOF) {
+					return
+				}
+				continue
+			}
+		} else {
+			cmdReq, parseErr := parseTCPTextCommand(input)
+			if parseErr != nil {
+				_ = conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+				_ = encoder.Encode(SocketResponse{Success: false, Message: parseErr.Error()})
+				if errors.Is(err, io.EOF) {
+					return
+				}
+				continue
+			}
+			req = cmdReq
+		}
+
+		if req.Command == "subscribe" {
+			handleTCPSubscription(conn, req)
 			return
 		}
-	} else {
-		cmdReq, parseErr := parseTCPTextCommand(input)
-		if parseErr != nil {
-			resp := SocketResponse{Success: false, Message: parseErr.Error()}
-			_ = json.NewEncoder(conn).Encode(resp)
+
+		resp := executeTCPCommand(req)
+		_ = conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+		if encodeErr := encoder.Encode(resp); encodeErr != nil {
+			log.Printf("Failed to write TCP response: %v", encodeErr)
 			return
 		}
-		req = cmdReq
-	}
 
-	resp := executeTCPCommand(req)
-	_ = conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
-	if err := json.NewEncoder(conn).Encode(resp); err != nil {
-		log.Printf("Failed to write TCP response: %v", err)
+		if errors.Is(err, io.EOF) {
+			return
+		}
 	}
 }
 
@@ -2186,22 +2334,20 @@ func executeTCPCommand(req SocketRequest) SocketResponse {
 
 	// Step 2: token-based access for all TCP commands
 	token, _ := req.Data["token"].(string)
-	if token == "" {
-		return SocketResponse{Success: false, Message: "authentication required: call auth first, then include token"}
-	}
-
-	username, isAdmin, err := tokenManager.ValidateToken(token)
+	username, _, nextToken, err := authenticateTCPToken(token)
 	if err != nil {
-		return SocketResponse{Success: false, Message: fmt.Sprintf("invalid token: %v", err)}
+		return SocketResponse{Success: false, Message: err.Error()}
 	}
 
-	if err := tokenManager.ConsumeToken(token); err != nil {
-		return SocketResponse{Success: false, Message: fmt.Sprintf("failed to consume token: %v", err)}
-	}
-
-	nextToken, err := tokenManager.IssueToken(username, isAdmin)
-	if err != nil {
-		return SocketResponse{Success: false, Message: fmt.Sprintf("failed to issue next token: %v", err)}
+	if req.Command == "export" {
+		dbname, _ := req.Data["dbname"].(string)
+		scope, _ := req.Data["scope"].(string)
+		includeTokens := strings.EqualFold(strings.TrimSpace(scope), "full")
+		exported, exportErr := exportDatabaseJSON(dbname, includeTokens)
+		if exportErr != nil {
+			return SocketResponse{Success: false, Message: exportErr.Error(), Data: map[string]interface{}{"token": nextToken}}
+		}
+		return SocketResponse{Success: true, Data: map[string]interface{}{"json": exported, "token": nextToken}}
 	}
 
 	// Handle SQL query command
@@ -2240,20 +2386,6 @@ func executeTCPCommand(req SocketRequest) SocketResponse {
 	}
 
 	resp := executeSocketCommand(req)
-
-	// TCP export is sanitized by default.
-	// Client must explicitly request full payload with scope=full to include tokens.
-	if req.Command == "export" && resp.Success {
-		scope, _ := req.Data["scope"].(string)
-		includeTokens := strings.EqualFold(strings.TrimSpace(scope), "full")
-		if data, ok := resp.Data["json"].(string); ok {
-			sanitized, err := sanitizeExportJSON(data, includeTokens)
-			if err != nil {
-				return SocketResponse{Success: false, Message: fmt.Sprintf("failed to sanitize export: %v", err)}
-			}
-			resp.Data["json"] = sanitized
-		}
-	}
 
 	if resp.Data == nil {
 		resp.Data = map[string]interface{}{}
@@ -2322,6 +2454,23 @@ func parseTCPTextCommand(input string) (SocketRequest, error) {
 			scope = parts[2]
 		}
 		return SocketRequest{Command: "export", Data: map[string]interface{}{"dbname": dbname, "scope": scope}}, nil
+	case "subscribe":
+		if len(parts) < 2 {
+			return SocketRequest{}, fmt.Errorf("usage: subscribe <token> [interval_seconds] [scope] [dbname]")
+		}
+		intervalSeconds := "5"
+		scope := ""
+		dbname := ""
+		if len(parts) > 2 {
+			intervalSeconds = parts[2]
+		}
+		if len(parts) > 3 {
+			scope = parts[3]
+		}
+		if len(parts) > 4 {
+			dbname = parts[4]
+		}
+		return SocketRequest{Command: "subscribe", Data: map[string]interface{}{"token": parts[1], "interval_seconds": intervalSeconds, "scope": scope, "dbname": dbname}}, nil
 	case "listusers":
 		return SocketRequest{Command: "listusers"}, nil
 	case "listservices":
