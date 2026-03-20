@@ -2056,6 +2056,7 @@ func watchServiceConfig(serviceManager *modules.ServiceManager) {
 	// Store previous configs to detect changes
 	var prevHTTPCfg, prevTCPCfg *modules.ServiceConfig
 	var prevWSCfg *modules.WebSocketConfig
+	var lastHTTPState string
 
 	// Check config immediately on startup (don't wait 2 seconds)
 	checkConfig := func() {
@@ -2074,8 +2075,12 @@ func watchServiceConfig(serviceManager *modules.ServiceManager) {
 					prevHTTPCfg.Enabled != httpCfg.Enabled))
 
 		if httpCfg != nil {
-			log.Printf("[DEBUG] HTTP config found: enabled=%v, host=%s, port=%d (changed=%v)",
-				httpCfg.Enabled, httpCfg.Host, httpCfg.Port, configChanged)
+			state := fmt.Sprintf("present:%t:%s:%d", httpCfg.Enabled, httpCfg.Host, httpCfg.Port)
+			if state != lastHTTPState {
+				log.Printf("[DEBUG] HTTP config found: enabled=%v, host=%s, port=%d (changed=%v)",
+					httpCfg.Enabled, httpCfg.Host, httpCfg.Port, configChanged)
+				lastHTTPState = state
+			}
 			if httpCfg.Enabled {
 				if httpServer == nil || configChanged {
 					// Stop old server if it exists
@@ -2097,7 +2102,10 @@ func watchServiceConfig(serviceManager *modules.ServiceManager) {
 				}
 			}
 		} else {
-			log.Printf("[DEBUG] No HTTP config found in database")
+			if lastHTTPState != "missing" {
+				log.Printf("[DEBUG] No HTTP config found in database")
+				lastHTTPState = "missing"
+			}
 			if httpServer != nil {
 				httpServer.Close()
 				httpServer = nil
