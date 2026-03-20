@@ -208,6 +208,91 @@ func (db *Database) AddUser(username, password string) error {
 	return nil
 }
 
+// RemoveUser removes a user from the in-memory user registry, system.users table,
+// and the user's database. It is idempotent for already-missing users.
+func (db *Database) RemoveUser(username string) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return fmt.Errorf("username is required")
+	}
+	if username == "admin" {
+		return fmt.Errorf("cannot remove admin user")
+	}
+
+	delete(db.users, username)
+	delete(db.data, username)
+
+	systemDB, exists := db.data["system"]
+	if !exists || systemDB == nil {
+		return nil
+	}
+
+	usersTable := systemDB.PrivateTables["users"]
+	if usersTable == nil {
+		systemDB.LastModified = time.Now()
+		return nil
+	}
+
+	filtered := make([]interface{}, 0, len(usersTable))
+	for _, row := range usersTable {
+		rowMap, ok := row.(map[string]interface{})
+		if !ok || rowMap == nil {
+			filtered = append(filtered, row)
+			continue
+		}
+		rowUsername, _ := rowMap["username"].(string)
+		if strings.EqualFold(strings.TrimSpace(rowUsername), username) {
+			continue
+		}
+		filtered = append(filtered, row)
+	}
+	systemDB.PrivateTables["users"] = filtered
+	systemDB.LastModified = time.Now()
+	return nil
+}
+
+// UserExists reports whether the in-memory registry already contains the user.
+func (db *Database) UserExists(username string) bool {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	_, exists := db.users[strings.TrimSpace(username)]
+	return exists
+}
+
+// UserPasswordMatches reports whether the user exists and the password matches.
+func (db *Database) UserPasswordMatches(username, password string) bool {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	user, exists := db.users[strings.TrimSpace(username)]
+	if !exists || user == nil {
+		return false
+	}
+	return user.PasswordHash == db.hashPassword(password)
+}
+
+// LogWriteWithID appends a write journal entry with a caller-provided ID.
+func (db *Database) LogWriteWithID(id, operation, database, table string, data map[string]interface{}, where map[string]string, isPrivate bool) {
+	db.journalMu.Lock()
+	defer db.journalMu.Unlock()
+
+	entry := &WriteJournalEntry{
+		ID:         id,
+		Operation:  operation,
+		Database:   database,
+		Table:      table,
+		Data:       data,
+		Where:      where,
+		IsPrivate:  isPrivate,
+		Timestamp:  time.Now().Unix(),
+		Replicated: false,
+	}
+
+	db.writeJournal = append(db.writeJournal, entry)
+}
+
 // DeleteDatabase removes a database instance by name.
 func (db *Database) DeleteDatabase(databaseName string) error {
 	db.mu.Lock()

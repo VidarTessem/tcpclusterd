@@ -1872,30 +1872,33 @@ func applyClusterWrite(operation string, data map[string]interface{}) error {
 		IsPrivate:  true,
 	}
 
+	// Apply locally first so the current node always becomes the durable source of truth.
+	if err := executeReplicatedWrite(writeOp); err != nil {
+		return err
+	}
+
+	// Track for later replication before attempting immediate cluster commit.
+	db.LogWriteWithID(writeID, writeOp.Operation, writeOp.Database, writeOp.Table, writeOp.Data, writeOp.Where, writeOp.IsPrivate)
+
 	if clusterManager != nil {
 		clusterManager.TrackWrite(writeID, "system", "cluster_op", operation, data)
 	}
 
-	// Replicate first (strong consistency across peers)
+	// Try immediate replication, but do not roll back the local write if peers are unavailable.
 	if peerServer != nil && clusterManager != nil {
-		// Use shorter timeout for import operations
 		timeout := 10 * time.Second
 		if operation == "import" {
 			timeout = 60 * time.Second
 		}
 		if err := peerServer.ReplicateWriteAndWait(writeOp, timeout); err != nil {
-			// Provide clearer error message for network issues
 			if strings.Contains(err.Error(), "timed out") {
-				diagnostics := performNetworkDiagnostics()
-				return fmt.Errorf("cluster write timed out - check if all nodes are online and network connectivity is available.%s", diagnostics)
+				log.Printf("[WARN] Cluster write %s queued for retry after timeout: %v%s", writeID, err, performNetworkDiagnostics())
+			} else {
+				log.Printf("[WARN] Cluster write %s queued for retry: %v", writeID, err)
 			}
-			return fmt.Errorf("cluster write failed: %w", err)
+		} else {
+			db.MarkWriteReplicated(writeID)
 		}
-	}
-
-	// Apply locally after successful replication
-	if err := executeReplicatedWrite(writeOp); err != nil {
-		return err
 	}
 
 	if err := db.SaveRuntimeSnapshot(); err != nil {
@@ -1914,6 +1917,12 @@ func executeReplicatedWrite(writeOp *modules.WriteOperation) error {
 		if username == "" || password == "" {
 			return fmt.Errorf("add_user requires username and password")
 		}
+		if db.UserExists(username) {
+			if db.UserPasswordMatches(username, password) {
+				return nil
+			}
+			return fmt.Errorf("user already exists")
+		}
 		return db.AddUser(username, password)
 
 	case "remove_user":
@@ -1921,12 +1930,7 @@ func executeReplicatedWrite(writeOp *modules.WriteOperation) error {
 		if username == "" || username == "admin" {
 			return fmt.Errorf("invalid username")
 		}
-		where := map[string]string{"username": username}
-		_, err := db.DeleteRows("system", "users", where, true)
-		if err != nil {
-			return err
-		}
-		return db.DeleteDatabase(username)
+		return db.RemoveUser(username)
 
 	case "flush_tokens":
 		_, err := db.DeleteRows("system", "tokens", map[string]string{}, true)
