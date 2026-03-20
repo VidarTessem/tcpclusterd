@@ -190,6 +190,23 @@ func main() {
 	removeCluster := flag.String("remove-cluster", "", "Deprecated: cluster peers are configured via CLUSTER_PEERS in .env")
 	flag.Parse()
 
+	// Support unquoted config flags, e.g.:
+	//   --config-tcp enabled=true port=8081 host=0.0.0.0
+	// Standard Go flag parsing only captures the first token after the flag value.
+	// If there are trailing key=value tokens and one config flag is active, append them.
+	if *configHTTP != "" && flag.NArg() > 0 {
+		parts := append([]string{*configHTTP}, flag.Args()...)
+		*configHTTP = strings.TrimSpace(strings.Join(parts, " "))
+	}
+	if *configTCP != "" && flag.NArg() > 0 {
+		parts := append([]string{*configTCP}, flag.Args()...)
+		*configTCP = strings.TrimSpace(strings.Join(parts, " "))
+	}
+	if *configWS != "" && flag.NArg() > 0 {
+		parts := append([]string{*configWS}, flag.Args()...)
+		*configWS = strings.TrimSpace(strings.Join(parts, " "))
+	}
+
 	// Get optional arguments for export and peer-metrics
 	var exportDbName string
 	if *export && flag.NArg() > 0 {
