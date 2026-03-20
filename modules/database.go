@@ -916,12 +916,17 @@ func (db *Database) ImportFromJSON(data []byte) error {
 		return err
 	}
 
+	normalizedData, err := normalizeImportedSnapshotPayload(decodedData)
+	if err != nil {
+		return err
+	}
+
 	var importData struct {
 		Databases map[string]*DatabaseInstance `json:"databases"`
 		Users     map[string]*User             `json:"users"` // Legacy field, ignored
 	}
 
-	if err := json.Unmarshal(decodedData, &importData); err != nil {
+	if err := json.Unmarshal(normalizedData, &importData); err != nil {
 		return fmt.Errorf("failed to unmarshal JSON: %w", err)
 	}
 
@@ -957,6 +962,50 @@ func (db *Database) ImportFromJSON(data []byte) error {
 	}
 
 	return nil
+}
+
+func normalizeImportedSnapshotPayload(data []byte) ([]byte, error) {
+	var root map[string]interface{}
+	if err := json.Unmarshal(data, &root); err != nil {
+		return nil, fmt.Errorf("failed to parse import payload: %w", err)
+	}
+
+	databases, _ := root["databases"].(map[string]interface{})
+	if databases == nil {
+		return data, nil
+	}
+
+	for _, rawDB := range databases {
+		dbMap, _ := rawDB.(map[string]interface{})
+		if dbMap == nil {
+			continue
+		}
+		normalizeImportedTableSet(dbMap, "public_tables")
+		normalizeImportedTableSet(dbMap, "private_tables")
+	}
+
+	encoded, err := json.Marshal(root)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode normalized import payload: %w", err)
+	}
+	return encoded, nil
+}
+
+func normalizeImportedTableSet(dbMap map[string]interface{}, key string) {
+	tables, _ := dbMap[key].(map[string]interface{})
+	if tables == nil {
+		return
+	}
+	for tableName, value := range tables {
+		switch typed := value.(type) {
+		case nil:
+			tables[tableName] = []interface{}{}
+		case []interface{}:
+			continue
+		default:
+			tables[tableName] = []interface{}{typed}
+		}
+	}
 }
 
 // SaveRuntimeSnapshot saves a snapshot of the database to the runtime folder
