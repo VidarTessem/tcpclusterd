@@ -2276,6 +2276,14 @@ func handleTCPConnection(conn net.Conn) {
 				// Process last line below and then close.
 				line = input
 			} else {
+				// On idle timeout: close silently. Sending an error response here
+				// would leave a stale {Success:false} message in the client's read
+				// buffer, causing the next legitimate request on the reused
+				// connection to be misinterpreted as a failed auth response → 502.
+				var netErr net.Error
+				if errors.As(err, &netErr) && netErr.Timeout() {
+					return
+				}
 				_ = conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 				_ = encoder.Encode(SocketResponse{Success: false, Message: fmt.Sprintf("failed to read request: %v", err)})
 				return

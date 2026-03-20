@@ -200,6 +200,20 @@ func (ps *PeerServer) manageOutboundConnections() {
 		for _, peer := range remotePeers {
 			ps.mu.RLock()
 			_, exists := ps.peers[peer.Address]
+			// Inbound connections are keyed by ephemeral port (e.g. "host:54321"),
+			// not the configured port ("host:8001"). Check by host so we don't
+			// open a redundant outbound connection — which would send a sync_request
+			// back to a peer that just reconnected and is still empty, causing the
+			// data-holding node to wipe itself.
+			if !exists {
+				peerHost, _, _ := net.SplitHostPort(peer.Address)
+				for addr := range ps.peers {
+					if connHost, _, err := net.SplitHostPort(addr); err == nil && connHost == peerHost {
+						exists = true
+						break
+					}
+				}
+			}
 			ps.mu.RUnlock()
 
 			if !exists {
@@ -339,10 +353,56 @@ func (ps *PeerServer) ReplicateWriteAndWait(writeOp *WriteOperation, timeout tim
 			ps.clusterManager.PurgeCommittedEntries()
 			return nil
 		}
+
+		// Fail-open if all configured remote peers are offline.
+		// This prevents write APIs from timing out when a cluster peer is down.
+		if !ps.hasAnyActiveRemoteConnection() {
+			ps.logger.Warn("No active peer connections; proceeding with local commit for write %s", writeOp.ID)
+			return nil
+		}
 		time.Sleep(100 * time.Millisecond)
 	}
 
 	return fmt.Errorf("timed out waiting for cluster commit for write %s - network connectivity issue or peer(s) offline", writeOp.ID)
+}
+
+// hasAnyActiveRemoteConnection checks if at least one configured remote peer currently has an active TCP connection.
+func (ps *PeerServer) hasAnyActiveRemoteConnection() bool {
+	if ps.clusterManager == nil {
+		return false
+	}
+
+	remotePeers := ps.clusterManager.GetRemotePeers()
+	if len(remotePeers) == 0 {
+		return false
+	}
+
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+
+	for _, rp := range remotePeers {
+		// Direct key match (outbound connection style: host:port)
+		if peer, ok := ps.peers[rp.Address]; ok && peer != nil && peer.conn != nil {
+			return true
+		}
+
+		// Inbound connection fallback: keyed by ephemeral source port.
+		rHost, _, rErr := net.SplitHostPort(rp.Address)
+		if rErr != nil {
+			continue
+		}
+		for addr, peer := range ps.peers {
+			if peer == nil || peer.conn == nil {
+				continue
+			}
+			host, _, err := net.SplitHostPort(addr)
+			if err == nil && host == rHost {
+				return true
+			}
+		}
+	}
+
+	return false
 }
 
 // handleReplication processes the write operation channel
@@ -536,6 +596,17 @@ func (ps *PeerServer) handleSyncResponse(msg *ReplicationMessage) {
 	hash := fmt.Sprintf("%x", sha256.Sum256(msg.SyncData))
 	if hash != msg.SyncChecksum {
 		ps.logger.Error("Sync checksum mismatch! Expected %s, got %s", msg.SyncChecksum, hash)
+		return
+	}
+
+	// Guard against split-brain data loss: if our local database is larger than
+	// the incoming snapshot, we have more data than the peer sending it. Refuse
+	// the import so we don't overwrite a richer local state with a stale/empty
+	// peer's snapshot. This is a safety net for the race where both nodes dial
+	// outbound to each other on reconnect and both send a sync_request.
+	if localData, err := ps.db.ExportToJSON(); err == nil && len(localData) > len(msg.SyncData) {
+		ps.logger.Warn("Ignoring sync response from %s: local data (%d bytes) > received data (%d bytes) — local state is richer, preserving",
+			msg.FromPeer, len(localData), len(msg.SyncData))
 		return
 	}
 
