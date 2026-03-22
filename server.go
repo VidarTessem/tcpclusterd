@@ -1244,10 +1244,12 @@ func executeSocketCommand(req SocketRequest) SocketResponse {
 		if jsonStr == "" {
 			return SocketResponse{Success: false, Message: "json data required"}
 		}
+		dbname, _ := req.Data["dbname"].(string)
 		clearMode, _ := req.Data["clear"].(bool)
 		if err := applyClusterWrite("import", map[string]interface{}{
-			"json":  jsonStr,
-			"clear": clearMode,
+			"dbname": dbname,
+			"json":   jsonStr,
+			"clear":  clearMode,
 		}); err != nil {
 			return SocketResponse{Success: false, Message: err.Error()}
 		}
@@ -2077,6 +2079,7 @@ func executeReplicatedWrite(writeOp *modules.WriteOperation) error {
 		return db.UpsertRowDirect(writeOp.Database, writeOp.Table, writeOp.Data, writeOp.IsPrivate)
 
 	case "import":
+		dbname, _ := writeOp.Data["dbname"].(string)
 		jsonStr, _ := writeOp.Data["json"].(string)
 		if jsonStr == "" {
 			return fmt.Errorf("import requires json data")
@@ -2086,6 +2089,9 @@ func executeReplicatedWrite(writeOp *modules.WriteOperation) error {
 			if err := db.ImportFromJSON([]byte(`{"databases":{}}`)); err != nil {
 				return fmt.Errorf("failed to clear data before import: %w", err)
 			}
+		}
+		if strings.TrimSpace(dbname) != "" {
+			return db.ImportDatabaseFromJSON(strings.TrimSpace(dbname), []byte(jsonStr))
 		}
 		return db.ImportFromJSON([]byte(jsonStr))
 

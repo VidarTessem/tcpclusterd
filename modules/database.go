@@ -930,10 +930,16 @@ func (db *Database) ImportFromJSON(data []byte) error {
 		return fmt.Errorf("failed to unmarshal JSON: %w", err)
 	}
 
+	if importData.Databases == nil {
+		importData.Databases = make(map[string]*DatabaseInstance)
+	}
+
 	db.data = importData.Databases
+	db.ensureSystemDatabaseLocked()
 
 	// Rebuild users map from system.users table
 	db.users = make(map[string]*User)
+	db.adminUser = nil
 	if systemDB, exists := db.data["system"]; exists {
 		if usersTable, exists := systemDB.PrivateTables["users"]; exists {
 			for _, userRow := range usersTable {
@@ -962,6 +968,121 @@ func (db *Database) ImportFromJSON(data []byte) error {
 	}
 
 	return nil
+}
+
+// ImportDatabaseFromJSON imports only one database from JSON and preserves others.
+// This is used by scoped import writers (for example when a client only exports one db).
+func (db *Database) ImportDatabaseFromJSON(dbname string, data []byte) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	if strings.TrimSpace(dbname) == "" {
+		return fmt.Errorf("database name required")
+	}
+
+	decodedData, err := decodeRuntimeStorageBytes(data)
+	if err != nil {
+		return err
+	}
+
+	normalizedData, err := normalizeImportedSnapshotPayload(decodedData)
+	if err != nil {
+		return err
+	}
+
+	var importData struct {
+		Databases map[string]*DatabaseInstance `json:"databases"`
+	}
+	if err := json.Unmarshal(normalizedData, &importData); err != nil {
+		return fmt.Errorf("failed to unmarshal JSON: %w", err)
+	}
+
+	if importData.Databases == nil {
+		return fmt.Errorf("import payload missing databases")
+	}
+
+	importedDB, ok := importData.Databases[dbname]
+	if !ok || importedDB == nil {
+		return fmt.Errorf("import payload missing database '%s'", dbname)
+	}
+
+	if db.data == nil {
+		db.data = make(map[string]*DatabaseInstance)
+	}
+	db.data[dbname] = importedDB
+	db.ensureSystemDatabaseLocked()
+
+	if dbname == "system" {
+		db.users = make(map[string]*User)
+		db.adminUser = nil
+		if usersTable, exists := importedDB.PrivateTables["users"]; exists {
+			for _, userRow := range usersTable {
+				userMap, ok := userRow.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				username, _ := userMap["username"].(string)
+				passwordHash, _ := userMap["password_hash"].(string)
+				isAdmin, _ := userMap["is_admin"].(bool)
+				if username == "" {
+					continue
+				}
+				user := &User{
+					Username:     username,
+					PasswordHash: passwordHash,
+					IsAdmin:      isAdmin,
+				}
+				if createdAt, ok := userMap["created_at"].(float64); ok {
+					user.CreatedAt = time.Unix(int64(createdAt), 0)
+				} else if createdAtStr, ok := userMap["created_at"].(string); ok {
+					if t, parseErr := time.Parse(time.RFC3339, createdAtStr); parseErr == nil {
+						user.CreatedAt = t
+					}
+				}
+				db.users[user.Username] = user
+				if user.IsAdmin {
+					db.adminUser = user
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+func (db *Database) ensureSystemDatabaseLocked() {
+	if db.data == nil {
+		db.data = make(map[string]*DatabaseInstance)
+	}
+	systemDB, exists := db.data["system"]
+	if !exists || systemDB == nil {
+		systemDB = &DatabaseInstance{
+			Name:          "system",
+			PublicTables:  make(map[string][]interface{}),
+			PrivateTables: make(map[string][]interface{}),
+			LastModified:  time.Now(),
+		}
+		db.data["system"] = systemDB
+	}
+	if systemDB.PublicTables == nil {
+		systemDB.PublicTables = make(map[string][]interface{})
+	}
+	if systemDB.PrivateTables == nil {
+		systemDB.PrivateTables = make(map[string][]interface{})
+	}
+	if systemDB.PrivateTables["users"] == nil {
+		systemDB.PrivateTables["users"] = make([]interface{}, 0)
+	}
+	if systemDB.PrivateTables["tokens"] == nil {
+		systemDB.PrivateTables["tokens"] = make([]interface{}, 0)
+	}
+	if systemDB.PrivateTables["services_config"] == nil {
+		systemDB.PrivateTables["services_config"] = make([]interface{}, 0)
+	}
+	if systemDB.PublicTables["peer_metrics"] == nil {
+		systemDB.PublicTables["peer_metrics"] = make([]interface{}, 0)
+	}
+	systemDB.LastModified = time.Now()
 }
 
 func normalizeImportedSnapshotPayload(data []byte) ([]byte, error) {
