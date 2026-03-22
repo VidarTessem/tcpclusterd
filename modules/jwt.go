@@ -12,11 +12,19 @@ import (
 	"io"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
 
-// TokenManager manages JWT tokens with one-time use
+const (
+	tokenTypeOneTime  = "onetime"
+	tokenTypeLifetime = "lifetime"
+)
+
+// TokenManager manages JWT tokens with configurable usage mode.
+// TOKEN_TYPE=onetime  => token is consumed after successful validation
+// TOKEN_TYPE=lifetime => token can be reused until expiration/flush
 type TokenManager struct {
 	mu             sync.RWMutex
 	db             *Database
@@ -24,6 +32,7 @@ type TokenManager struct {
 	aesKey         [32]byte // AES-256 key
 	tokens         map[string]*TokenRecord
 	encryptionSalt string
+	tokenType      string
 	tokenTTL       time.Duration
 }
 
@@ -51,6 +60,7 @@ func NewTokenManager(db *Database, aesKeyString string, replManager *Replication
 		db:          db,
 		replManager: replManager,
 		tokens:      make(map[string]*TokenRecord),
+		tokenType:   tokenTypeOneTime,
 		tokenTTL:    0,
 	}
 
@@ -75,7 +85,22 @@ func NewTokenManager(db *Database, aesKeyString string, replManager *Replication
 	}
 	db.mu.Unlock()
 
-	if ttlStr := os.Getenv("TOKEN_TTL_SECONDS"); ttlStr != "" {
+	if tokenTypeRaw := strings.TrimSpace(strings.ToLower(os.Getenv("TOKEN_TYPE"))); tokenTypeRaw != "" {
+		switch tokenTypeRaw {
+		case tokenTypeOneTime, tokenTypeLifetime:
+			tm.tokenType = tokenTypeRaw
+		default:
+			// Keep safe default (onetime) for unknown values
+		}
+	}
+
+	// TOKEN_EXPIRATION is the preferred setting name.
+	// TOKEN_TTL_SECONDS is kept as backwards-compatible fallback.
+	ttlStr := strings.TrimSpace(os.Getenv("TOKEN_EXPIRATION"))
+	if ttlStr == "" {
+		ttlStr = strings.TrimSpace(os.Getenv("TOKEN_TTL_SECONDS"))
+	}
+	if ttlStr != "" {
 		if ttlSeconds, err := strconv.Atoi(ttlStr); err == nil && ttlSeconds > 0 {
 			tm.tokenTTL = time.Duration(ttlSeconds) * time.Second
 		}
@@ -284,8 +309,11 @@ func (tm *TokenManager) ValidateToken(encryptedToken string) (string, bool, erro
 	if !exists {
 		return "", false, fmt.Errorf("token not found")
 	}
+	if record == nil {
+		return "", false, fmt.Errorf("token not found")
+	}
 
-	if record.Used {
+	if tm.tokenType == tokenTypeOneTime && record.Used {
 		return "", false, fmt.Errorf("token already used")
 	}
 
@@ -300,6 +328,11 @@ func (tm *TokenManager) ValidateToken(encryptedToken string) (string, bool, erro
 
 // ConsumeToken marks a token as used and removes it
 func (tm *TokenManager) ConsumeToken(encryptedToken string) error {
+	if tm.tokenType == tokenTypeLifetime {
+		// Lifetime tokens remain valid until expiration/flush.
+		return nil
+	}
+
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
@@ -346,6 +379,20 @@ func (tm *TokenManager) ConsumeToken(encryptedToken string) error {
 	delete(tm.tokens, encryptedToken)
 
 	return nil
+}
+
+// TokenType returns current token behavior mode: onetime or lifetime.
+func (tm *TokenManager) TokenType() string {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+	return tm.tokenType
+}
+
+// TokenExpiration returns configured token expiration (0 means no expiration).
+func (tm *TokenManager) TokenExpiration() time.Duration {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+	return tm.tokenTTL
 }
 
 // FlushTokens removes all tokens from the system

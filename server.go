@@ -534,6 +534,11 @@ func startServer() {
 	if err != nil {
 		log.Fatalf("Failed to initialize token manager: %v", err)
 	}
+	if tokenManager.TokenExpiration() > 0 {
+		log.Printf("[auth:token] mode=%s expiration=%s", tokenManager.TokenType(), tokenManager.TokenExpiration())
+	} else {
+		log.Printf("[auth:token] mode=%s expiration=disabled", tokenManager.TokenType())
+	}
 
 	// Initialize peer server for cluster communication (if cluster configured)
 	if clusterManager != nil && localPeer != "" {
