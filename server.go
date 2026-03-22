@@ -1355,6 +1355,86 @@ func executeSocketCommand(req SocketRequest) SocketResponse {
 			Message: fmt.Sprintf("✓ Previous runtime database loaded from: %s", lastPath),
 		}
 
+	case "adjust":
+		// Atomically adjust (add/subtract) a column value in a table row
+		// Data: { token, dbname, table, column, delta (int), where (map) }
+		token, _ := req.Data["token"].(string)
+		dbname, _ := req.Data["dbname"].(string)
+		tableName, _ := req.Data["table"].(string)
+		columnName, _ := req.Data["column"].(string)
+		deltaRaw, _ := req.Data["delta"]
+		whereRaw, _ := req.Data["where"].(map[string]interface{})
+		isPrivate, _ := req.Data["private"].(bool)
+
+		if dbname == "" || tableName == "" || columnName == "" {
+			return SocketResponse{Success: false, Message: "adjust requires: dbname, table, column, delta, where"}
+		}
+
+		username, _, nextToken, err := authenticateTCPToken(token)
+		if err != nil {
+			return SocketResponse{Success: false, Message: err.Error()}
+		}
+
+		var delta float64
+		switch v := deltaRaw.(type) {
+		case float64:
+			delta = v
+		case int:
+			delta = float64(v)
+		case int64:
+			delta = float64(v)
+		case json.Number:
+			parsed, parseErr := v.Float64()
+			if parseErr != nil {
+				return SocketResponse{Success: false, Message: "delta must be a number"}
+			}
+			delta = parsed
+		case string:
+			parsed, parseErr := strconv.ParseFloat(v, 64)
+			if parseErr != nil {
+				return SocketResponse{Success: false, Message: "delta must be a number"}
+			}
+			delta = parsed
+		default:
+			return SocketResponse{Success: false, Message: "delta must be a number"}
+		}
+
+		// Convert where map[string]interface{} to where map[string]string
+		whereClause := make(map[string]string)
+		for k, v := range whereRaw {
+			whereClause[k] = fmt.Sprintf("%v", v)
+		}
+
+		// Perform atomically adjusted update
+		newValue, err := db.AdjustColumn(dbname, tableName, columnName, delta, whereClause, isPrivate)
+		if err != nil {
+			return SocketResponse{Success: false, Message: fmt.Sprintf("adjust failed: %v", err)}
+		}
+
+		// Log the adjustment
+		log.Printf("[adjust] user=%s dbname=%s table=%s column=%s delta=%g new_value=%g", username, dbname, tableName, columnName, delta, newValue)
+
+		// Replicate to cluster
+		if err := applyClusterWrite("adjust_column", map[string]interface{}{
+			"dbname":    dbname,
+			"table":     tableName,
+			"column":    columnName,
+			"delta":     delta,
+			"where":     whereClause,
+			"private":   isPrivate,
+			"new_value": newValue,
+		}); err != nil {
+			log.Printf("[adjust:replicate:warning] failed to replicate: %v", err)
+		}
+
+		return SocketResponse{
+			Success: true,
+			Data: map[string]interface{}{
+				"new_value": newValue,
+				"token":     nextToken,
+			},
+		}
+
 	default:
 		return SocketResponse{Success: false, Message: "unknown command"}
 	}

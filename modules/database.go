@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -781,6 +782,112 @@ func (db *Database) UpdateRowsDirect(databaseName, tableName string, updateData 
 
 	dbInstance.LastModified = time.Now()
 	return updatedCount, nil
+}
+
+// AdjustColumn atomically adjusts (adds/subtracts) a numeric column value for matching rows.
+// Both integer and decimal values are supported. Values stored as strings in the JSON
+// database (e.g. "1500" or "37.5") are automatically parsed.
+// Returns the new value as float64 and any error encountered.
+func (db *Database) AdjustColumn(databaseName, tableName, columnName string, delta float64, where map[string]string, isPrivate bool) (float64, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	dbInstance, exists := db.data[databaseName]
+	if !exists {
+		return 0, fmt.Errorf("database not found: %s", databaseName)
+	}
+
+	var tableData []interface{}
+	if isPrivate {
+		tableData = dbInstance.PrivateTables[tableName]
+	} else {
+		tableData = dbInstance.PublicTables[tableName]
+	}
+
+	if tableData == nil {
+		return 0, fmt.Errorf("table not found: %s", tableName)
+	}
+
+	var newValue float64
+	updatedCount := 0
+
+	for i, row := range tableData {
+		rowMap, ok := row.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		// Check if row matches where clause
+		matches := true
+		for key, val := range where {
+			rowVal, exists := rowMap[key]
+			if !exists || fmt.Sprintf("%v", rowVal) != val {
+				matches = false
+				break
+			}
+		}
+
+		if !matches {
+			continue
+		}
+
+		// Get current column value. Handles float64, int, int64, and string-stored
+		// numbers (e.g. "1500" or "37.5") that appear when JSON is hand-edited.
+		currentVal, exists := rowMap[columnName]
+		if !exists {
+			currentVal = float64(0)
+		}
+
+		var current float64
+		switch v := currentVal.(type) {
+		case float64:
+			current = v
+		case int:
+			current = float64(v)
+		case int64:
+			current = float64(v)
+		case json.Number:
+			parsed, err := v.Float64()
+			if err != nil {
+				return 0, fmt.Errorf("column %s has non-numeric json.Number: %s", columnName, v)
+			}
+			current = parsed
+		case string:
+			// Value stored as a string in the JSON array (e.g. "1500" or "37.5")
+			if v == "" {
+				current = 0
+			} else {
+				parsed, err := strconv.ParseFloat(v, 64)
+				if err != nil {
+					return 0, fmt.Errorf("column %s has non-numeric string value: %q", columnName, v)
+				}
+				current = parsed
+			}
+		default:
+			return 0, fmt.Errorf("column %s has unsupported type %T (value: %v)", columnName, v, v)
+		}
+
+		// Apply delta — store as float64; integer values round-trip cleanly
+		newValue = current + delta
+		rowMap[columnName] = newValue
+		tableData[i] = rowMap
+		updatedCount++
+	}
+
+	if updatedCount == 0 {
+		return 0, fmt.Errorf("no rows matched the where clause")
+	}
+
+	if isPrivate {
+		dbInstance.PrivateTables[tableName] = tableData
+	} else {
+		dbInstance.PublicTables[tableName] = tableData
+	}
+
+	dbInstance.LastModified = time.Now()
+	db.LogWrite("adjust", databaseName, tableName, map[string]interface{}{columnName: newValue}, where, isPrivate)
+
+	return newValue, nil
 }
 
 func upsertWhereFromRow(rowData map[string]interface{}) map[string]string {
