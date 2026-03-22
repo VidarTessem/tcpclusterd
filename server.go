@@ -230,6 +230,7 @@ func main() {
 
 	// Parse command line arguments FIRST to check if this is a CLI command
 	addUser := flag.String("add", "", "Add a new user and create their personal database (usage: --add username)")
+	force := flag.Bool("force", false, "Use with --add to create user even if personal database already exists")
 	password := flag.String("password", "", "Password for user (if not provided, a random one will be generated)")
 	clearRuntimes := flag.Bool("clearruntimes", false, "Clear old runtime folders")
 	export := flag.Bool("export", false, "Export database and exit (usage: --export [dbname])")
@@ -292,7 +293,7 @@ func main() {
 	// This MUST be done BEFORE initializing cluster manager
 	if isCLICommand {
 		// Try socket connection first
-		err := handleCLIViaSocket(*export, exportDbName, *exportLastRuntime, *importFile, *importClear, *lastRuntime, *loadLastRuntime, *importPersistent, *listUsers, *listServices, *listCluster, *addUser, *removeUser, *flushTokens, *configHTTP, *configTCP, *configWS, *peerMetrics, peerMetricsAddr, *addCluster, *removeCluster, *password)
+		err := handleCLIViaSocket(*export, exportDbName, *exportLastRuntime, *importFile, *importClear, *lastRuntime, *loadLastRuntime, *importPersistent, *listUsers, *listServices, *listCluster, *addUser, *force, *removeUser, *flushTokens, *configHTTP, *configTCP, *configWS, *peerMetrics, peerMetricsAddr, *addCluster, *removeCluster, *password)
 		if err == nil {
 			os.Exit(0)
 		}
@@ -730,7 +731,7 @@ func isServerRunning() bool {
 }
 
 // handleCLIViaSocket handles all CLI commands by connecting to the running server socket
-func handleCLIViaSocket(export bool, exportDbName string, exportLastRuntime bool, importFile string, importClear bool, lastRuntime bool, loadLastRuntime bool, importPersistent bool, listUsers bool, listServices bool, listCluster bool, addUser string, removeUser string, flushTokens bool, configHTTP string, configTCP string, configWS string, peerMetrics bool, peerMetricsAddr string, addCluster string, removeCluster string, password string) error {
+func handleCLIViaSocket(export bool, exportDbName string, exportLastRuntime bool, importFile string, importClear bool, lastRuntime bool, loadLastRuntime bool, importPersistent bool, listUsers bool, listServices bool, listCluster bool, addUser string, force bool, removeUser string, flushTokens bool, configHTTP string, configTCP string, configWS string, peerMetrics bool, peerMetricsAddr string, addCluster string, removeCluster string, password string) error {
 	// Handle export
 	if export {
 		req := SocketRequest{
@@ -812,6 +813,7 @@ func handleCLIViaSocket(export bool, exportDbName string, exportLastRuntime bool
 			Command: "adduser",
 			Data: map[string]interface{}{
 				"username": addUser,
+				"force":    force,
 				"password": userPassword,
 			},
 		}
@@ -1190,14 +1192,19 @@ func executeSocketCommand(req SocketRequest) SocketResponse {
 	case "adduser":
 		username, _ := req.Data["username"].(string)
 		password, _ := req.Data["password"].(string)
+		force, _ := req.Data["force"].(bool)
 		if username == "" || password == "" {
 			return SocketResponse{Success: false, Message: "username and password required"}
 		}
 		if err := applyClusterWrite("add_user", map[string]interface{}{
 			"username": username,
+			"force":    force,
 			"password": password,
 		}); err != nil {
 			return SocketResponse{Success: false, Message: err.Error()}
+		}
+		if force {
+			return SocketResponse{Success: true, Message: "✓ User '" + username + "' created successfully (force mode)"}
 		}
 		return SocketResponse{Success: true, Message: "✓ User '" + username + "' and database created successfully"}
 
@@ -2038,6 +2045,7 @@ func executeReplicatedWrite(writeOp *modules.WriteOperation) error {
 	case "add_user":
 		username, _ := writeOp.Data["username"].(string)
 		password, _ := writeOp.Data["password"].(string)
+		force, _ := writeOp.Data["force"].(bool)
 		if username == "" || password == "" {
 			return fmt.Errorf("add_user requires username and password")
 		}
@@ -2047,7 +2055,7 @@ func executeReplicatedWrite(writeOp *modules.WriteOperation) error {
 			}
 			return fmt.Errorf("user already exists")
 		}
-		return db.AddUser(username, password)
+		return db.AddUserWithForce(username, password, force)
 
 	case "remove_user":
 		username, _ := writeOp.Data["username"].(string)

@@ -161,6 +161,12 @@ func (db *Database) AuthenticateUser(username, password string) (*User, error) {
 
 // AddUser adds a new user with a corresponding database
 func (db *Database) AddUser(username, password string) error {
+	return db.AddUserWithForce(username, password, false)
+}
+
+// AddUserWithForce adds a new user and, when force=true, allows attaching the
+// user to an already existing personal database without deleting it.
+func (db *Database) AddUserWithForce(username, password string, force bool) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
@@ -170,7 +176,7 @@ func (db *Database) AddUser(username, password string) error {
 	}
 
 	// Check if database already exists
-	if _, exists := db.data[username]; exists {
+	if _, exists := db.data[username]; exists && !force {
 		return fmt.Errorf("database already exists")
 	}
 
@@ -184,12 +190,14 @@ func (db *Database) AddUser(username, password string) error {
 
 	db.users[username] = user
 
-	// Create user's personal database
-	db.data[username] = &DatabaseInstance{
-		Name:          username,
-		PublicTables:  make(map[string][]interface{}),
-		PrivateTables: make(map[string][]interface{}),
-		LastModified:  time.Now(),
+	// Create user's personal database only if it does not already exist.
+	if _, exists := db.data[username]; !exists {
+		db.data[username] = &DatabaseInstance{
+			Name:          username,
+			PublicTables:  make(map[string][]interface{}),
+			PrivateTables: make(map[string][]interface{}),
+			LastModified:  time.Now(),
+		}
 	}
 
 	// Store user in system.users table
