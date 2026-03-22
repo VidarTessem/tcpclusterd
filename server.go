@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -139,6 +140,66 @@ func findLatestRuntimePath() string {
 	return latestPath
 }
 
+// findPreviousRuntimePath finds the second-to-last (previous) runtime folder
+func findPreviousRuntimePath() string {
+	runtimeDir := "runtime"
+	entries, err := os.ReadDir(runtimeDir)
+	if err != nil {
+		return "" // No runtime directory exists
+	}
+
+	var times []time.Time
+	var paths []string
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		// Parse timestamp from folder name (format: 2006-01-02_15-04-05)
+		t, err := time.Parse("2006-01-02_15-04-05", entry.Name())
+		if err != nil {
+			continue // Skip folders that don't match the format
+		}
+		times = append(times, t)
+		paths = append(paths, filepath.Join(runtimeDir, entry.Name()))
+	}
+
+	if len(times) < 2 {
+		return "" // Need at least 2 runtimes to get the previous one
+	}
+
+	// Sort times to find second-to-last
+	type timePathPair struct {
+		t    time.Time
+		path string
+	}
+	var pairs []timePathPair
+	for i := range times {
+		pairs = append(pairs, timePathPair{times[i], paths[i]})
+	}
+
+	// Sort by time descending
+	sort.Slice(pairs, func(i, j int) bool {
+		return pairs[i].t.After(pairs[j].t)
+	})
+
+	// Return second item (index 1) which is the previous runtime
+	return pairs[1].path
+}
+
+// importDatabaseFromJSON imports a database from JSON data via cluster replication
+func importDatabaseFromJSON(importData map[string]interface{}) error {
+	jsonBytes, err := json.Marshal(importData)
+	if err != nil {
+		return fmt.Errorf("failed to marshal import data: %v", err)
+	}
+
+	return applyClusterWrite("import", map[string]interface{}{
+		"json":  string(jsonBytes),
+		"clear": true, // Always clear when loading previous runtime
+	})
+}
+
 func parseEnvBool(value string, defaultValue bool) bool {
 	v := strings.ToLower(strings.TrimSpace(value))
 	if v == "" {
@@ -175,6 +236,7 @@ func main() {
 	importFile := flag.String("import", "", "Import database from file")
 	importClear := flag.Bool("clear", false, "Use with --import to clear current runtime data before import")
 	lastRuntime := flag.Bool("lastruntime", false, "Load database from last runtime folder and start server")
+	loadLastRuntime := flag.Bool("loadlastruntime", false, "Load database from the previous (not current) runtime folder and start server")
 	exportLastRuntime := flag.Bool("exportlastruntime", false, "Export database from last runtime folder and exit")
 	importPersistent := flag.Bool("importpersistent", false, "Load database from persistent backup and start server")
 	listUsers := flag.Bool("listusers", false, "List all users and exit")
@@ -219,7 +281,7 @@ func main() {
 	}
 
 	// Check if this is a CLI command (not starting server)
-	isCLICommand := *export || *exportLastRuntime || *importFile != "" || *lastRuntime || *importPersistent || *listUsers || *listServices || *listCluster || *addUser != "" || *removeUser != "" || *flushTokens || *configHTTP != "" || *configTCP != "" || *configWS != "" || *peerMetrics || *addCluster != "" || *removeCluster != ""
+	isCLICommand := *export || *exportLastRuntime || *importFile != "" || *lastRuntime || *loadLastRuntime || *importPersistent || *listUsers || *listServices || *listCluster || *addUser != "" || *removeUser != "" || *flushTokens || *configHTTP != "" || *configTCP != "" || *configWS != "" || *peerMetrics || *addCluster != "" || *removeCluster != ""
 
 	// Print version only when starting server (no arguments)
 	if !isCLICommand {
@@ -230,7 +292,7 @@ func main() {
 	// This MUST be done BEFORE initializing cluster manager
 	if isCLICommand {
 		// Try socket connection first
-		err := handleCLIViaSocket(*export, exportDbName, *exportLastRuntime, *importFile, *importClear, *lastRuntime, *importPersistent, *listUsers, *listServices, *listCluster, *addUser, *removeUser, *flushTokens, *configHTTP, *configTCP, *configWS, *peerMetrics, peerMetricsAddr, *addCluster, *removeCluster, *password)
+		err := handleCLIViaSocket(*export, exportDbName, *exportLastRuntime, *importFile, *importClear, *lastRuntime, *loadLastRuntime, *importPersistent, *listUsers, *listServices, *listCluster, *addUser, *removeUser, *flushTokens, *configHTTP, *configTCP, *configWS, *peerMetrics, peerMetricsAddr, *addCluster, *removeCluster, *password)
 		if err == nil {
 			os.Exit(0)
 		}
@@ -668,7 +730,7 @@ func isServerRunning() bool {
 }
 
 // handleCLIViaSocket handles all CLI commands by connecting to the running server socket
-func handleCLIViaSocket(export bool, exportDbName string, exportLastRuntime bool, importFile string, importClear bool, lastRuntime bool, importPersistent bool, listUsers bool, listServices bool, listCluster bool, addUser string, removeUser string, flushTokens bool, configHTTP string, configTCP string, configWS string, peerMetrics bool, peerMetricsAddr string, addCluster string, removeCluster string, password string) error {
+func handleCLIViaSocket(export bool, exportDbName string, exportLastRuntime bool, importFile string, importClear bool, lastRuntime bool, loadLastRuntime bool, importPersistent bool, listUsers bool, listServices bool, listCluster bool, addUser string, removeUser string, flushTokens bool, configHTTP string, configTCP string, configWS string, peerMetrics bool, peerMetricsAddr string, addCluster string, removeCluster string, password string) error {
 	// Handle export
 	if export {
 		req := SocketRequest{
@@ -909,6 +971,20 @@ func handleCLIViaSocket(export bool, exportDbName string, exportLastRuntime bool
 		}
 		if !resp.Success {
 			return fmt.Errorf("lastruntime failed: %s", resp.Message)
+		}
+		fmt.Println(resp.Message)
+		return nil
+	}
+
+	// Handle loadlastruntime via socket (load previous runtime)
+	if loadLastRuntime {
+		req := SocketRequest{Command: "loadlastruntime"}
+		resp, err := sendSocketCommand(req)
+		if err != nil {
+			return err
+		}
+		if !resp.Success {
+			return fmt.Errorf("loadlastruntime failed: %s", resp.Message)
 		}
 		fmt.Println(resp.Message)
 		return nil
@@ -1240,6 +1316,35 @@ func executeSocketCommand(req SocketRequest) SocketResponse {
 			return SocketResponse{Success: false, Message: "No previous runtime found"}
 		}
 		return SocketResponse{Success: true, Message: "Last runtime directory: " + lastPath}
+
+	case "loadlastruntime":
+		// Find the second-to-last runtime (previous runtime, not current)
+		lastPath := findPreviousRuntimePath()
+		if lastPath == "" {
+			return SocketResponse{Success: false, Message: "No previous runtime found"}
+		}
+
+		// Load database from that runtime
+		data, err := os.ReadFile(lastPath + "/database.json")
+		if err != nil {
+			return SocketResponse{Success: false, Message: fmt.Sprintf("failed to read runtime database: %v", err)}
+		}
+
+		// Parse and load into current database
+		var importData map[string]interface{}
+		if err := json.Unmarshal(data, &importData); err != nil {
+			return SocketResponse{Success: false, Message: fmt.Sprintf("failed to parse runtime database: %v", err)}
+		}
+
+		// Import the data into the running database
+		if err := importDatabaseFromJSON(importData); err != nil {
+			return SocketResponse{Success: false, Message: fmt.Sprintf("failed to import database: %v", err)}
+		}
+
+		return SocketResponse{
+			Success: true,
+			Message: fmt.Sprintf("✓ Previous runtime database loaded from: %s", lastPath),
+		}
 
 	default:
 		return SocketResponse{Success: false, Message: "unknown command"}

@@ -162,31 +162,35 @@ func (tm *TokenManager) cleanupExpiredTokens() {
 	tm.mu.RUnlock()
 
 	// Collect expired tokens from database table (including replicated ones not in memory)
-	tm.db.mu.RLock()
-	dbTokens := tm.db.data["system"].PrivateTables["tokens"]
-	for _, row := range dbTokens {
-		tokenMap, ok := row.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		token, _ := tokenMap["token"].(string)
-		if token == "" {
-			continue
-		}
+	if tm.db != nil {
+		tm.db.mu.RLock()
+		if systemDB, ok := tm.db.data["system"]; ok && systemDB.PrivateTables != nil {
+			dbTokens := systemDB.PrivateTables["tokens"]
+			for _, row := range dbTokens {
+				tokenMap, ok := row.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				token, _ := tokenMap["token"].(string)
+				if token == "" {
+					continue
+				}
 
-		issuedAt := tokenTimestampToTime(tokenMap["issued_at"])
-		if issuedAt.IsZero() {
-			issuedAt = tokenTimestampToTime(tokenMap["created_at"])
-		}
-		if issuedAt.IsZero() {
-			continue
-		}
+				issuedAt := tokenTimestampToTime(tokenMap["issued_at"])
+				if issuedAt.IsZero() {
+					issuedAt = tokenTimestampToTime(tokenMap["created_at"])
+				}
+				if issuedAt.IsZero() {
+					continue
+				}
 
-		if now.Sub(issuedAt) >= tm.tokenTTL {
-			expiredTokens[token] = struct{}{}
+				if now.Sub(issuedAt) >= tm.tokenTTL {
+					expiredTokens[token] = struct{}{}
+				}
+			}
 		}
+		tm.db.mu.RUnlock()
 	}
-	tm.db.mu.RUnlock()
 
 	if len(expiredTokens) == 0 {
 		return
@@ -313,20 +317,25 @@ func (tm *TokenManager) ConsumeToken(encryptedToken string) error {
 	record.UsedAt = time.Now()
 
 	// Update in system database - remove the used token
-	tm.db.mu.Lock()
-	tokens := tm.db.data["system"].PrivateTables["tokens"]
-	newTokens := make([]interface{}, 0)
-	for _, t := range tokens {
-		if tokenMap, ok := t.(map[string]interface{}); ok {
-			if tokenMap["token"] == encryptedToken {
-				// Skip this token - delete it
-				continue
+	if tm.db != nil {
+		tm.db.mu.Lock()
+		if systemDB, ok := tm.db.data["system"]; ok && systemDB.PrivateTables != nil {
+			tokens := systemDB.PrivateTables["tokens"]
+			newTokens := make([]interface{}, 0)
+			for _, t := range tokens {
+				if tokenMap, ok := t.(map[string]interface{}); ok {
+					if tokenMap["token"] == encryptedToken {
+						// Skip this token - delete it
+						continue
+					}
+				}
+				newTokens = append(newTokens, t)
 			}
+			systemDB.PrivateTables["tokens"] = newTokens
+			tm.db.data["system"] = systemDB
 		}
-		newTokens = append(newTokens, t)
+		tm.db.mu.Unlock()
 	}
-	tm.db.data["system"].PrivateTables["tokens"] = newTokens
-	tm.db.mu.Unlock()
 
 	// Replicate token consumption to all peer servers
 	if tm.replManager != nil {
