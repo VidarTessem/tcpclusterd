@@ -687,6 +687,10 @@ func retryFailedClusterWrites() {
 
 		logger.Warn("Retrying %d failed cluster writes", len(failed))
 		for _, entry := range failed {
+			timeout := 10 * time.Second
+			if strings.EqualFold(strings.TrimSpace(entry.Operation), "import") {
+				timeout = 60 * time.Second
+			}
 			op := &modules.WriteOperation{
 				ID:         entry.ID,
 				Operation:  entry.Operation,
@@ -695,7 +699,7 @@ func retryFailedClusterWrites() {
 				SourcePeer: "retry",
 				IsPrivate:  true,
 			}
-			if err := peerServer.ReplicateWriteAndWait(op, 10*time.Second); err != nil {
+			if err := peerServer.ReplicateWriteAndWait(op, timeout); err != nil {
 				logger.Warn("Retry failed for %s: %v", entry.ID, err)
 			} else {
 				logger.Info("Retry succeeded for %s", entry.ID)

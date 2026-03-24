@@ -204,6 +204,15 @@ func updateJournalEnvelopes(update func([]journalEnvelope) ([]journalEnvelope, e
 	return rewriteJournalEnvelopesUnlocked(updated)
 }
 
+// ResetReplicationJournal drops all persisted replication journal state.
+// Use this after a verified full-state replacement, where any older per-write
+// journal entries are stale and must not be replayed.
+func ResetReplicationJournal() error {
+	journalFileMu.Lock()
+	defer journalFileMu.Unlock()
+	return rewriteJournalEnvelopesUnlocked([]journalEnvelope{})
+}
+
 // Debug logs a debug message
 func (l *Logger) Debug(format string, v ...interface{}) {
 	if l.logLevel <= DEBUG {
