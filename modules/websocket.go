@@ -45,7 +45,6 @@ type WebSocketClient struct {
 	query           string
 	token           string
 	user            *User
-	lastData        interface{}
 	send            chan *WebSocketMessage
 	done            chan bool
 	mu              sync.RWMutex
@@ -387,10 +386,6 @@ func (client *WebSocketClient) sendInitialData() {
 		client.sendError(fmt.Sprintf("Failed to get initial data: %v", err))
 		return
 	}
-
-	client.mu.Lock()
-	client.lastData = result
-	client.mu.Unlock()
 
 	client.send <- &WebSocketMessage{
 		Type:      "data",

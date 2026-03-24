@@ -281,7 +281,7 @@ Automatic backups created in `backups/` directory. Set up external backup:
 Check logs:
 ```bash
 tail -f logs/app.log
-tail -f logs/audit.log
+tail -f journal.log
 ```
 
 Monitor cluster health periodically:

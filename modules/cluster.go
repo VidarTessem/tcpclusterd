@@ -17,31 +17,24 @@ type PeerInfo struct {
 
 // ClusterManager handles cluster peer communication
 type ClusterManager struct {
-	mu            sync.RWMutex
-	peers         []PeerInfo
-	localPeer     *PeerInfo
-	changeJournal *ChangeJournal
-	logger        *Logger
-}
-
-// ChangeJournal tracks pending writes that need to be replicated
-type ChangeJournal struct {
-	mu      sync.Mutex
-	entries []JournalEntry
+	mu        sync.RWMutex
+	peers     []PeerInfo
+	localPeer *PeerInfo
+	logger    *Logger
 }
 
 // JournalEntry represents a pending write operation
 type JournalEntry struct {
-	ID             string // unique ID
-	Database       string // database name
-	Table          string // table name
-	Operation      string // "insert", "update", "delete"
-	Data           map[string]interface{}
-	Timestamp      time.Time
-	CommittedPeers map[string]bool // peers that have acknowledged
-	Failed         bool
-	RetryCount     int
-	LastRetryTime  time.Time
+	ID             string                 `json:"id"`
+	Database       string                 `json:"database"`
+	Table          string                 `json:"table"`
+	Operation      string                 `json:"operation"`
+	Data           map[string]interface{} `json:"data,omitempty"`
+	Timestamp      time.Time              `json:"timestamp"`
+	CommittedPeers map[string]bool        `json:"committed_peers,omitempty"`
+	Failed         bool                   `json:"failed"`
+	RetryCount     int                    `json:"retry_count"`
+	LastRetryTime  time.Time              `json:"last_retry_time"`
 }
 
 // NewClusterManager creates a cluster manager from comma-separated peer addresses
@@ -51,9 +44,8 @@ func NewClusterManager(clusterPeersStr string, logger *Logger) (*ClusterManager,
 	}
 
 	cm := &ClusterManager{
-		peers:         []PeerInfo{},
-		changeJournal: &ChangeJournal{entries: []JournalEntry{}},
-		logger:        logger,
+		peers:  []PeerInfo{},
+		logger: logger,
 	}
 
 	// Parse peers from comma-separated string
@@ -151,16 +143,13 @@ func (cm *ClusterManager) GetAllPeers() []PeerInfo {
 // LogWrite records a database write to the change journal
 func (cm *ClusterManager) LogWrite(database, table, operation string, data map[string]interface{}) string {
 	// Generate unique ID
-	id := fmt.Sprintf("%s-%d-%d", operation, time.Now().UnixNano(), len(cm.changeJournal.entries))
+	id := fmt.Sprintf("%s-%d", operation, time.Now().UnixNano())
 	cm.TrackWrite(id, database, table, operation, data)
 	return id
 }
 
 // TrackWrite records a write with a caller-provided ID.
 func (cm *ClusterManager) TrackWrite(id, database, table, operation string, data map[string]interface{}) {
-	cm.changeJournal.mu.Lock()
-	defer cm.changeJournal.mu.Unlock()
-
 	entry := JournalEntry{
 		ID:             id,
 		Database:       database,
@@ -177,50 +166,66 @@ func (cm *ClusterManager) TrackWrite(id, database, table, operation string, data
 	details := fmt.Sprintf("db=%s table=%s op=%s data_keys=%v", database, table, operation, getMapKeys(data))
 	cm.logger.Audit("WRITE", details)
 
-	cm.changeJournal.entries = append(cm.changeJournal.entries, entry)
+	if err := appendJournalEnvelope(journalEnvelope{Kind: "cluster", Cluster: &entry}); err != nil && cm.logger != nil {
+		cm.logger.Warn("Failed to append cluster journal entry %s: %v", id, err)
+	}
 }
 
 // MarkCommitted marks a write as committed on a peer
 func (cm *ClusterManager) MarkCommitted(journalID, peerAddr string) {
-	cm.changeJournal.mu.Lock()
-	defer cm.changeJournal.mu.Unlock()
-
-	for i, entry := range cm.changeJournal.entries {
-		if entry.ID == journalID {
-			cm.changeJournal.entries[i].CommittedPeers[peerAddr] = true
-			cm.logger.Debug("Journal entry %s committed on peer %s", journalID, peerAddr)
+	_ = updateJournalEnvelopes(func(records []journalEnvelope) ([]journalEnvelope, error) {
+		for i, record := range records {
+			if record.Kind != "cluster" || record.Cluster == nil || record.Cluster.ID != journalID {
+				continue
+			}
+			if record.Cluster.CommittedPeers == nil {
+				record.Cluster.CommittedPeers = make(map[string]bool)
+			}
+			record.Cluster.CommittedPeers[peerAddr] = true
+			records[i] = record
+			if cm.logger != nil {
+				cm.logger.Debug("Journal entry %s committed on peer %s", journalID, peerAddr)
+			}
 			break
 		}
-	}
+		return records, nil
+	})
 }
 
 // MarkFailed marks a write as failed on a peer
 func (cm *ClusterManager) MarkFailed(journalID, peerAddr string) {
-	cm.changeJournal.mu.Lock()
-	defer cm.changeJournal.mu.Unlock()
-
-	for i, entry := range cm.changeJournal.entries {
-		if entry.ID == journalID {
-			cm.changeJournal.entries[i].Failed = true
-			cm.changeJournal.entries[i].RetryCount++
-			cm.changeJournal.entries[i].LastRetryTime = time.Now()
-			cm.logger.Warn("Journal entry %s failed on peer %s (retry count: %d)", journalID, peerAddr, cm.changeJournal.entries[i].RetryCount)
+	_ = updateJournalEnvelopes(func(records []journalEnvelope) ([]journalEnvelope, error) {
+		for i, record := range records {
+			if record.Kind != "cluster" || record.Cluster == nil || record.Cluster.ID != journalID {
+				continue
+			}
+			record.Cluster.Failed = true
+			record.Cluster.RetryCount++
+			record.Cluster.LastRetryTime = time.Now()
+			records[i] = record
+			if cm.logger != nil {
+				cm.logger.Warn("Journal entry %s failed on peer %s (retry count: %d)", journalID, peerAddr, record.Cluster.RetryCount)
+			}
 			break
 		}
-	}
+		return records, nil
+	})
 }
 
 // GetFailedEntries returns all failed entries that need retry
 func (cm *ClusterManager) GetFailedEntries() []JournalEntry {
-	cm.changeJournal.mu.Lock()
-	defer cm.changeJournal.mu.Unlock()
-
 	var failed []JournalEntry
 	now := time.Now()
-
-	for _, entry := range cm.changeJournal.entries {
-		if entry.Failed && now.Sub(entry.LastRetryTime) >= time.Minute {
-			failed = append(failed, entry)
+	records, err := readJournalEnvelopes()
+	if err != nil {
+		if cm.logger != nil {
+			cm.logger.Warn("Failed to read cluster journal: %v", err)
+		}
+		return failed
+	}
+	for _, record := range records {
+		if record.Kind == "cluster" && record.Cluster != nil && record.Cluster.Failed && now.Sub(record.Cluster.LastRetryTime) >= time.Minute {
+			failed = append(failed, *record.Cluster)
 		}
 	}
 
@@ -229,19 +234,22 @@ func (cm *ClusterManager) GetFailedEntries() []JournalEntry {
 
 // IsFullyCommitted checks if a write has been committed on all peers
 func (cm *ClusterManager) IsFullyCommitted(journalID string) bool {
-	cm.changeJournal.mu.Lock()
-	defer cm.changeJournal.mu.Unlock()
-
 	remotePeers := cm.getRemotePeersLocked()
 	if len(remotePeers) == 0 {
 		// Single server - always committed
 		return true
 	}
-
-	for _, entry := range cm.changeJournal.entries {
-		if entry.ID == journalID {
+	records, err := readJournalEnvelopes()
+	if err != nil {
+		if cm.logger != nil {
+			cm.logger.Warn("Failed to read cluster journal: %v", err)
+		}
+		return false
+	}
+	for _, record := range records {
+		if record.Kind == "cluster" && record.Cluster != nil && record.Cluster.ID == journalID {
 			for _, peer := range remotePeers {
-				if !entry.CommittedPeers[peer.Address] {
+				if !record.Cluster.CommittedPeers[peer.Address] {
 					return false
 				}
 			}
@@ -254,32 +262,33 @@ func (cm *ClusterManager) IsFullyCommitted(journalID string) bool {
 
 // PurgeCommittedEntries removes entries that have been fully committed
 func (cm *ClusterManager) PurgeCommittedEntries() {
-	cm.changeJournal.mu.Lock()
-	defer cm.changeJournal.mu.Unlock()
-
 	remotePeers := cm.getRemotePeersLocked()
-	var remaining []JournalEntry
-
-	for _, entry := range cm.changeJournal.entries {
-		// Keep if not fully committed on all peers
-		fullyCommitted := true
-		if len(remotePeers) > 0 {
-			for _, peer := range remotePeers {
-				if !entry.CommittedPeers[peer.Address] {
-					fullyCommitted = false
-					break
+	_ = updateJournalEnvelopes(func(records []journalEnvelope) ([]journalEnvelope, error) {
+		remaining := make([]journalEnvelope, 0, len(records))
+		for _, record := range records {
+			if record.Kind != "cluster" || record.Cluster == nil {
+				remaining = append(remaining, record)
+				continue
+			}
+			fullyCommitted := true
+			if len(remotePeers) > 0 {
+				for _, peer := range remotePeers {
+					if !record.Cluster.CommittedPeers[peer.Address] {
+						fullyCommitted = false
+						break
+					}
 				}
 			}
+			if fullyCommitted {
+				if cm.logger != nil {
+					cm.logger.Debug("Purging committed journal entry: %s", record.Cluster.ID)
+				}
+				continue
+			}
+			remaining = append(remaining, record)
 		}
-
-		if !fullyCommitted {
-			remaining = append(remaining, entry)
-		} else {
-			cm.logger.Debug("Purging committed journal entry: %s", entry.ID)
-		}
-	}
-
-	cm.changeJournal.entries = remaining
+		return remaining, nil
+	})
 }
 
 // getRemotePeersLocked returns remote peers (called with mutex held)

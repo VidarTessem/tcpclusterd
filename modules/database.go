@@ -28,8 +28,6 @@ type Database struct {
 	replicationPeers     []string
 	autoClearRuntimes    bool
 	autoBackupEnabled    bool
-	writeJournal         []*WriteJournalEntry // Track all writes for replication
-	journalMu            sync.RWMutex
 	lastRuntimeCleanup   time.Time
 }
 
@@ -284,9 +282,6 @@ func (db *Database) UserPasswordMatches(username, password string) bool {
 
 // LogWriteWithID appends a write journal entry with a caller-provided ID.
 func (db *Database) LogWriteWithID(id, operation, database, table string, data map[string]interface{}, where map[string]string, isPrivate bool) {
-	db.journalMu.Lock()
-	defer db.journalMu.Unlock()
-
 	entry := &WriteJournalEntry{
 		ID:         id,
 		Operation:  operation,
@@ -299,7 +294,9 @@ func (db *Database) LogWriteWithID(id, operation, database, table string, data m
 		Replicated: false,
 	}
 
-	db.writeJournal = append(db.writeJournal, entry)
+	if err := appendJournalEnvelope(journalEnvelope{Kind: "db_write", DBWrite: entry}); err != nil && GlobalLogger != nil {
+		GlobalLogger.Warn("Failed to append write journal entry %s: %v", id, err)
+	}
 }
 
 // DeleteDatabase removes a database instance by name.
@@ -996,7 +993,7 @@ func (db *Database) ExportToJSON() ([]byte, error) {
 		"databases": db.data,
 	}
 
-	return json.MarshalIndent(exportData, "", "  ")
+	return json.Marshal(exportData)
 }
 
 // ExportToJSONDatabase exports a specific database to JSON (both public and private tables)
@@ -1018,7 +1015,7 @@ func (db *Database) ExportToJSONDatabase(dbname string) ([]byte, error) {
 		},
 	}
 
-	return json.MarshalIndent(exportData, "", "  ")
+	return json.Marshal(exportData)
 }
 
 // ImportFromJSON imports database from JSON
@@ -1831,9 +1828,6 @@ func (db *Database) GetPeerMetric(peerAddress string) (map[string]interface{}, e
 
 // LogWrite adds a write operation to the journal for replication
 func (db *Database) LogWrite(operation, database, table string, data map[string]interface{}, where map[string]string, isPrivate bool) {
-	db.journalMu.Lock()
-	defer db.journalMu.Unlock()
-
 	entry := &WriteJournalEntry{
 		ID:         fmt.Sprintf("%s-%d", operation, time.Now().UnixNano()),
 		Operation:  operation,
@@ -1846,18 +1840,24 @@ func (db *Database) LogWrite(operation, database, table string, data map[string]
 		Replicated: false,
 	}
 
-	db.writeJournal = append(db.writeJournal, entry)
+	if err := appendJournalEnvelope(journalEnvelope{Kind: "db_write", DBWrite: entry}); err != nil && GlobalLogger != nil {
+		GlobalLogger.Warn("Failed to append write journal entry %s: %v", entry.ID, err)
+	}
 }
 
 // GetUnreplicatedWrites returns all writes that haven't been replicated yet
 func (db *Database) GetUnreplicatedWrites() []*WriteJournalEntry {
-	db.journalMu.RLock()
-	defer db.journalMu.RUnlock()
-
 	var unreplicated []*WriteJournalEntry
-	for _, entry := range db.writeJournal {
-		if !entry.Replicated {
-			unreplicated = append(unreplicated, entry)
+	records, err := readJournalEnvelopes()
+	if err != nil {
+		if GlobalLogger != nil {
+			GlobalLogger.Warn("Failed to read write journal: %v", err)
+		}
+		return unreplicated
+	}
+	for _, record := range records {
+		if record.Kind == "db_write" && record.DBWrite != nil && !record.DBWrite.Replicated {
+			unreplicated = append(unreplicated, record.DBWrite)
 		}
 	}
 	return unreplicated
@@ -1865,31 +1865,30 @@ func (db *Database) GetUnreplicatedWrites() []*WriteJournalEntry {
 
 // MarkWriteReplicated marks a write as replicated
 func (db *Database) MarkWriteReplicated(writeID string) {
-	db.journalMu.Lock()
-	defer db.journalMu.Unlock()
-
-	for _, entry := range db.writeJournal {
-		if entry.ID == writeID {
-			entry.Replicated = true
-			break
+	_ = updateJournalEnvelopes(func(records []journalEnvelope) ([]journalEnvelope, error) {
+		filtered := make([]journalEnvelope, 0, len(records))
+		for _, record := range records {
+			if record.Kind == "db_write" && record.DBWrite != nil && record.DBWrite.ID == writeID {
+				continue
+			}
+			filtered = append(filtered, record)
 		}
-	}
+		return filtered, nil
+	})
 }
 
 // ClearOldJournalEntries removes old replicated entries (older than 1 hour)
 func (db *Database) ClearOldJournalEntries() {
-	db.journalMu.Lock()
-	defer db.journalMu.Unlock()
-
-	now := time.Now().Unix()
-	threshold := int64(3600) // 1 hour
-
-	var filtered []*WriteJournalEntry
-	for _, entry := range db.writeJournal {
-		if !(entry.Replicated && (now-entry.Timestamp) > threshold) {
-			filtered = append(filtered, entry)
+	_ = updateJournalEnvelopes(func(records []journalEnvelope) ([]journalEnvelope, error) {
+		now := time.Now().Unix()
+		threshold := int64(3600)
+		filtered := make([]journalEnvelope, 0, len(records))
+		for _, record := range records {
+			if record.Kind == "db_write" && record.DBWrite != nil && record.DBWrite.Replicated && (now-record.DBWrite.Timestamp) > threshold {
+				continue
+			}
+			filtered = append(filtered, record)
 		}
-	}
-
-	db.writeJournal = filtered
+		return filtered, nil
+	})
 }

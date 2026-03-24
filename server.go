@@ -67,8 +67,8 @@ func loadConfig() *Config {
 		AutoClearRuntimes:    parseEnvBool(os.Getenv("AUTO_CLEAR_RUNTIMES"), false),
 		AutoBackupEnabled:    parseEnvBool(os.Getenv("AUTO_BACKUP"), true),
 		LogLevel:             getEnvOrDefault("LOG_LEVEL", "info"),
-		LogFile:              getEnvOrDefault("LOG_FILE", "logs/app.log"),
-		AuditLogFile:         getEnvOrDefault("AUDIT_LOG_FILE", "logs/audit.log"),
+		LogFile:              normalizeLogFilePath(os.Getenv("LOG_FILE")),
+		AuditLogFile:         normalizeJournalLogPath(os.Getenv("AUDIT_LOG_FILE")),
 		ClusterPeers:         getEnvOrDefault("CLUSTER_PEERS", ""),
 		AdminPassword:        getEnvOrDefault("ADMIN_PASSWORD", "admin"),
 	}
@@ -215,14 +215,54 @@ func getEnvOrDefault(key, defaultValue string) string {
 	return defaultValue
 }
 
+func normalizeLogFilePath(value string) string {
+	trimmed := strings.TrimSpace(value)
+	switch trimmed {
+	case "", "app.log", "logs/app.log":
+		return "system.log"
+	default:
+		return trimmed
+	}
+}
+
+func normalizeJournalLogPath(value string) string {
+	trimmed := strings.TrimSpace(value)
+	switch trimmed {
+	case "", "audit.log", "logs/audit.log":
+		return "journal.log"
+	default:
+		return trimmed
+	}
+}
+
+func setupSystemLog(logFilePath string) error {
+	path := normalizeLogFilePath(logFilePath)
+	if dir := filepath.Dir(path); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return fmt.Errorf("failed to create log directory: %w", err)
+		}
+	}
+
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to open system log: %w", err)
+	}
+
+	log.SetOutput(file)
+	log.SetFlags(log.LstdFlags)
+	return nil
+}
+
 func main() {
 	// Load .env file FIRST, before any config parsing
-	if err := godotenv.Load(); err != nil {
-		log.Printf("Note: .env file not found or error loading: %v", err)
-	}
+	_ = godotenv.Load()
 
 	// NOW parse configuration from environment
 	config = loadConfig()
+	if err := setupSystemLog(config.LogFile); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to initialize system log: %v\n", err)
+		os.Exit(1)
+	}
 
 	// Initialize logger (must be before any logging)
 	modules.InitLogger(config.LogLevel, config.LogFile, config.AuditLogFile)
