@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,14 +27,15 @@ const (
 // TOKEN_TYPE=onetime  => token is consumed after successful validation
 // TOKEN_TYPE=lifetime => token can be reused until expiration/flush
 type TokenManager struct {
-	mu             sync.RWMutex
-	db             *Database
-	replManager    *ReplicationManager
-	aesKey         [32]byte // AES-256 key
-	tokens         map[string]*TokenRecord
-	encryptionSalt string
-	tokenType      string
-	tokenTTL       time.Duration
+	mu               sync.RWMutex
+	db               *Database
+	replManager      *ReplicationManager
+	aesKey           [32]byte // AES-256 key
+	tokens           map[string]*TokenRecord
+	encryptionSalt   string
+	tokenType        string
+	tokenTTL         time.Duration
+	maxTokensPerUser int
 }
 
 // TokenRecord stores information about issued tokens
@@ -57,11 +59,12 @@ type JWTPayload struct {
 // NewTokenManager creates a new token manager
 func NewTokenManager(db *Database, aesKeyString string, replManager *ReplicationManager) (*TokenManager, error) {
 	tm := &TokenManager{
-		db:          db,
-		replManager: replManager,
-		tokens:      make(map[string]*TokenRecord),
-		tokenType:   tokenTypeOneTime,
-		tokenTTL:    0,
+		db:               db,
+		replManager:      replManager,
+		tokens:           make(map[string]*TokenRecord),
+		tokenType:        tokenTypeOneTime,
+		tokenTTL:         0,
+		maxTokensPerUser: 0,
 	}
 
 	// Derive AES key from provided string (hash with SHA512, take first 32 bytes)
@@ -103,6 +106,12 @@ func NewTokenManager(db *Database, aesKeyString string, replManager *Replication
 	if ttlStr != "" {
 		if ttlSeconds, err := strconv.Atoi(ttlStr); err == nil && ttlSeconds > 0 {
 			tm.tokenTTL = time.Duration(ttlSeconds) * time.Second
+		}
+	}
+
+	if maxTokensStr := strings.TrimSpace(os.Getenv("MAX_TOKENS_PER_USER")); maxTokensStr != "" {
+		if maxTokens, err := strconv.Atoi(maxTokensStr); err == nil && maxTokens > 0 {
+			tm.maxTokensPerUser = maxTokens
 		}
 	}
 
@@ -234,6 +243,93 @@ func (tm *TokenManager) cleanupExpiredTokens() {
 	tm.mu.Unlock()
 }
 
+func tokenRowIssuedAt(row map[string]interface{}) time.Time {
+	if row == nil {
+		return time.Time{}
+	}
+	issuedAt := tokenTimestampToTime(row["issued_at"])
+	if !issuedAt.IsZero() {
+		return issuedAt
+	}
+	return tokenTimestampToTime(row["created_at"])
+}
+
+func (tm *TokenManager) ensureUserTokenCapacityLocked(username string, incomingTokens int) error {
+	if tm.maxTokensPerUser <= 0 || tm.db == nil {
+		return nil
+	}
+
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return nil
+	}
+
+	type tokenRowRef struct {
+		Token    string
+		IssuedAt time.Time
+	}
+
+	tm.db.mu.RLock()
+	systemDB, ok := tm.db.data["system"]
+	if !ok || systemDB == nil || systemDB.PrivateTables == nil {
+		tm.db.mu.RUnlock()
+		return nil
+	}
+	rows := systemDB.PrivateTables["tokens"]
+	userTokens := make([]tokenRowRef, 0)
+	for _, rawRow := range rows {
+		row, ok := rawRow.(map[string]interface{})
+		if !ok || row == nil {
+			continue
+		}
+		if strings.TrimSpace(fmt.Sprintf("%v", row["username"])) != username {
+			continue
+		}
+		token := strings.TrimSpace(fmt.Sprintf("%v", row["token"]))
+		if token == "" {
+			continue
+		}
+		userTokens = append(userTokens, tokenRowRef{
+			Token:    token,
+			IssuedAt: tokenRowIssuedAt(row),
+		})
+	}
+	tm.db.mu.RUnlock()
+
+	if incomingTokens < 0 {
+		incomingTokens = 0
+	}
+
+	overflow := len(userTokens) + incomingTokens - tm.maxTokensPerUser
+	if overflow <= 0 {
+		return nil
+	}
+
+	sort.Slice(userTokens, func(i, j int) bool {
+		left := userTokens[i]
+		right := userTokens[j]
+		if left.IssuedAt.Equal(right.IssuedAt) {
+			return left.Token < right.Token
+		}
+		if left.IssuedAt.IsZero() {
+			return true
+		}
+		if right.IssuedAt.IsZero() {
+			return false
+		}
+		return left.IssuedAt.Before(right.IssuedAt)
+	})
+
+	for _, tokenRef := range userTokens[:overflow] {
+		delete(tm.tokens, tokenRef.Token)
+		if _, err := tm.db.DeleteRows("system", "tokens", map[string]string{"token": tokenRef.Token}, true); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 // IssueToken issues a new JWT token for a user
 func (tm *TokenManager) IssueToken(username string, isAdmin bool) (string, error) {
 	tm.mu.Lock()
@@ -252,6 +348,10 @@ func (tm *TokenManager) IssueToken(username string, isAdmin bool) (string, error
 		IsAdmin:  isAdmin,
 		IssuedAt: time.Now().Unix(),
 		Nonce:    nonce,
+	}
+
+	if err := tm.ensureUserTokenCapacityLocked(username, 1); err != nil {
+		return "", fmt.Errorf("failed to enforce max tokens per user: %w", err)
 	}
 
 	// Encrypt payload
@@ -393,6 +493,13 @@ func (tm *TokenManager) TokenExpiration() time.Duration {
 	tm.mu.RLock()
 	defer tm.mu.RUnlock()
 	return tm.tokenTTL
+}
+
+// MaxTokensPerUser returns the configured per-user token cap. Zero means unlimited.
+func (tm *TokenManager) MaxTokensPerUser() int {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+	return tm.maxTokensPerUser
 }
 
 // FlushTokens removes all tokens from the system

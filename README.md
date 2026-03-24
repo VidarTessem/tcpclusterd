@@ -26,8 +26,11 @@ CLUSTER_PEERS="[fd00:250:250:d:1::aaaa]:5000,[fd00:250:250:d:1::aaab]:5000"
 ADMIN_PASSWORD="ditt-sikre-passord"
 AES_KEY="32-tegns-krypteringsnøkkel-her"
 REPLICATION_TOKEN="hemmelig-replikeringstoken"
-TOKEN_TTL_SECONDS="3600"
+TOKEN_EXPIRATION="3600"
+MAX_TOKENS_PER_USER="10"
 ```
+
+`MAX_TOKENS_PER_USER` er valgfri. Når en bruker logger inn og går over grensen, slettes den eldste aktive tokenen automatisk.
 
 ### 3. Start Serveren
 
