@@ -167,7 +167,7 @@ func (client *WebSocketClient) handleMessages() {
 	}
 }
 
-// handleAuth authenticates the client and issues a new token
+// handleAuth authenticates the client and keeps the validated token on the connection.
 func (client *WebSocketClient) handleAuth(req WebSocketRequest) {
 	// Validate token if provided
 	var username string
@@ -181,33 +181,24 @@ func (client *WebSocketClient) handleAuth(req WebSocketRequest) {
 			client.sendError("Invalid token: " + err.Error())
 			return
 		}
-		// Consume the provided token
-		client.tokenManager.ConsumeToken(req.Token)
 	} else {
 		client.sendError("No token provided")
 		return
 	}
 
-	// Issue new token for this connection
-	newToken, err := client.tokenManager.IssueToken(username, isAdmin)
-	if err != nil {
-		client.sendError("Failed to issue token: " + err.Error())
-		return
-	}
-
 	// Store authenticated user and token
 	client.mu.Lock()
-	client.token = newToken
+	client.token = req.Token
 	client.user = &User{
 		Username: username,
 		IsAdmin:  isAdmin,
 	}
 	client.mu.Unlock()
 
-	// Send new token to client
+	// Return the validated token to the client for compatibility.
 	client.send <- &WebSocketMessage{
 		Type:      "token",
-		Token:     newToken,
+		Token:     req.Token,
 		Timestamp: time.Now().Unix(),
 	}
 

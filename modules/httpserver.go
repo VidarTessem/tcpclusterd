@@ -512,8 +512,6 @@ func (hs *HTTPServer) handleQuery(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
-		// Consume token (one-time use)
-		hs.tokenManager.ConsumeToken(req.Token)
 	} else if req.Username != "" && req.Password != "" {
 		// Authenticate with credentials
 		user, err := hs.db.AuthenticateUser(req.Username, req.Password)
@@ -569,23 +567,26 @@ func (hs *HTTPServer) handleQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Issue new token for next query (one-time use tokens)
-	newToken, err := hs.tokenManager.IssueToken(username, isAdmin)
-	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(QueryResponse{
-			OK:    true,
-			Data:  result,
-			Error: fmt.Sprintf("warning: failed to issue new token: %v", err),
-		})
-		return
+	responseToken := req.Token
+	if responseToken == "" {
+		var issueErr error
+		responseToken, issueErr = hs.tokenManager.IssueToken(username, isAdmin)
+		if issueErr != nil {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(QueryResponse{
+				OK:    true,
+				Data:  result,
+				Error: fmt.Sprintf("warning: failed to issue token: %v", issueErr),
+			})
+			return
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(QueryResponse{
 		OK:    true,
 		Data:  result,
-		Token: newToken,
+		Token: responseToken,
 	})
 }
 
@@ -815,7 +816,7 @@ func (hs *HTTPServer) handleDatabasePublic(w http.ResponseWriter, r *http.Reques
 		}
 
 		// Validate token
-		username, isAdmin, err := hs.tokenManager.ValidateToken(token)
+		_, _, err := hs.tokenManager.ValidateToken(token)
 		if err != nil {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnauthorized)
@@ -826,16 +827,12 @@ func (hs *HTTPServer) handleDatabasePublic(w http.ResponseWriter, r *http.Reques
 			return
 		}
 
-		// Consume token and issue new one
-		hs.tokenManager.ConsumeToken(token)
-		newToken, _ := hs.tokenManager.IssueToken(username, isAdmin)
-
-		// Return private data with new token
+		// Return private data with the same token for compatibility.
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"ok":    true,
 			"data":  privateTableData,
-			"token": newToken,
+			"token": token,
 		})
 		return
 	}

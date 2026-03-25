@@ -23,9 +23,9 @@ const (
 	tokenTypeLifetime = "lifetime"
 )
 
-// TokenManager manages JWT tokens with configurable usage mode.
-// TOKEN_TYPE=onetime  => token is consumed after successful validation
-// TOKEN_TYPE=lifetime => token can be reused until expiration/flush
+// TokenManager manages encrypted auth tokens.
+// Tokens are validated from their payload and are not required to exist in
+// in-memory caches or system tables.
 type TokenManager struct {
 	mu               sync.RWMutex
 	db               *Database
@@ -80,13 +80,6 @@ func NewTokenManager(db *Database, aesKeyString string, replManager *Replication
 		return nil, fmt.Errorf("failed to generate salt: %w", err)
 	}
 	tm.encryptionSalt = hex.EncodeToString(saltBytes)
-
-	// Initialize tokens table in system database
-	db.mu.Lock()
-	if db.data["system"].PrivateTables["tokens"] == nil {
-		db.data["system"].PrivateTables["tokens"] = make([]interface{}, 0)
-	}
-	db.mu.Unlock()
 
 	if tokenTypeRaw := strings.TrimSpace(strings.ToLower(os.Getenv("TOKEN_TYPE"))); tokenTypeRaw != "" {
 		switch tokenTypeRaw {
@@ -195,44 +188,8 @@ func (tm *TokenManager) cleanupExpiredTokens() {
 	}
 	tm.mu.RUnlock()
 
-	// Collect expired tokens from database table (including replicated ones not in memory)
-	if tm.db != nil {
-		tm.db.mu.RLock()
-		if systemDB, ok := tm.db.data["system"]; ok && systemDB.PrivateTables != nil {
-			dbTokens := systemDB.PrivateTables["tokens"]
-			for _, row := range dbTokens {
-				tokenMap, ok := row.(map[string]interface{})
-				if !ok {
-					continue
-				}
-				token, _ := tokenMap["token"].(string)
-				if token == "" {
-					continue
-				}
-
-				issuedAt := tokenTimestampToTime(tokenMap["issued_at"])
-				if issuedAt.IsZero() {
-					issuedAt = tokenTimestampToTime(tokenMap["created_at"])
-				}
-				if issuedAt.IsZero() {
-					continue
-				}
-
-				if now.Sub(issuedAt) >= tm.tokenTTL {
-					expiredTokens[token] = struct{}{}
-				}
-			}
-		}
-		tm.db.mu.RUnlock()
-	}
-
 	if len(expiredTokens) == 0 {
 		return
-	}
-
-	// Delete expired tokens through DB API so cleanup is replicated in cluster
-	for token := range expiredTokens {
-		_, _ = tm.db.DeleteRows("system", "tokens", map[string]string{"token": token}, true)
 	}
 
 	// Remove from in-memory cache
@@ -350,49 +307,17 @@ func (tm *TokenManager) IssueToken(username string, isAdmin bool) (string, error
 		Nonce:    nonce,
 	}
 
-	if err := tm.ensureUserTokenCapacityLocked(username, 1); err != nil {
-		return "", fmt.Errorf("failed to enforce max tokens per user: %w", err)
-	}
-
 	// Encrypt payload
 	encryptedToken, err := tm.encryptPayload(&payload)
 	if err != nil {
 		return "", fmt.Errorf("failed to encrypt token: %w", err)
 	}
 
-	// Store unencrypted record in database for validation
-	record := &TokenRecord{
+	tm.tokens[encryptedToken] = &TokenRecord{
 		Token:    encryptedToken,
 		Username: username,
 		IsAdmin:  isAdmin,
 		IssuedAt: time.Now(),
-		Used:     false,
-	}
-
-	tm.tokens[encryptedToken] = record
-
-	// Also store in system.tokens table
-	tm.db.mu.Lock()
-	if tm.db.data["system"].PrivateTables["tokens"] == nil {
-		tm.db.data["system"].PrivateTables["tokens"] = make([]interface{}, 0)
-	}
-	tokenRow := map[string]interface{}{
-		"token":      encryptedToken,
-		"username":   username,
-		"is_admin":   isAdmin,
-		"issued_at":  record.IssuedAt.Unix(),
-		"used":       false,
-		"created_at": time.Now().Unix(),
-	}
-	tm.db.data["system"].PrivateTables["tokens"] = append(
-		tm.db.data["system"].PrivateTables["tokens"],
-		tokenRow,
-	)
-	tm.db.mu.Unlock()
-
-	// Replicate token issuance to all peer servers
-	if tm.replManager != nil {
-		tm.replManager.EnqueueTokenIssueEvent(tokenRow)
 	}
 
 	return encryptedToken, nil
@@ -401,83 +326,26 @@ func (tm *TokenManager) IssueToken(username string, isAdmin bool) (string, error
 // ValidateToken validates a token and returns the username if valid
 // Returns the username if valid, empty string if invalid or already used
 func (tm *TokenManager) ValidateToken(encryptedToken string) (string, bool, error) {
-	tm.mu.Lock()
-	defer tm.mu.Unlock()
-
-	// Check if token exists and hasn't been used
-	record, exists := tm.tokens[encryptedToken]
-	if !exists {
-		return "", false, fmt.Errorf("token not found")
-	}
-	if record == nil {
-		return "", false, fmt.Errorf("token not found")
-	}
-
-	if tm.tokenType == tokenTypeOneTime && record.Used {
-		return "", false, fmt.Errorf("token already used")
-	}
-
 	// Decrypt and validate payload
 	payload, err := tm.decryptPayload(encryptedToken)
 	if err != nil {
 		return "", false, fmt.Errorf("failed to decrypt token: %w", err)
 	}
+	if strings.TrimSpace(payload.Username) == "" {
+		return "", false, fmt.Errorf("token missing username")
+	}
+	if tm.tokenTTL > 0 && payload.IssuedAt > 0 {
+		issuedAt := time.Unix(payload.IssuedAt, 0)
+		if time.Since(issuedAt) >= tm.tokenTTL {
+			return "", false, fmt.Errorf("token expired")
+		}
+	}
 
 	return payload.Username, payload.IsAdmin, nil
 }
 
-// ConsumeToken marks a token as used and removes it
+// ConsumeToken is a no-op for stateless reusable tokens.
 func (tm *TokenManager) ConsumeToken(encryptedToken string) error {
-	if tm.tokenType == tokenTypeLifetime {
-		// Lifetime tokens remain valid until expiration/flush.
-		return nil
-	}
-
-	tm.mu.Lock()
-	defer tm.mu.Unlock()
-
-	record, exists := tm.tokens[encryptedToken]
-	if !exists {
-		return fmt.Errorf("token not found")
-	}
-
-	if record.Used {
-		return fmt.Errorf("token already used")
-	}
-
-	// Mark as used
-	record.Used = true
-	record.UsedAt = time.Now()
-
-	// Update in system database - remove the used token
-	if tm.db != nil {
-		tm.db.mu.Lock()
-		if systemDB, ok := tm.db.data["system"]; ok && systemDB.PrivateTables != nil {
-			tokens := systemDB.PrivateTables["tokens"]
-			newTokens := make([]interface{}, 0)
-			for _, t := range tokens {
-				if tokenMap, ok := t.(map[string]interface{}); ok {
-					if tokenMap["token"] == encryptedToken {
-						// Skip this token - delete it
-						continue
-					}
-				}
-				newTokens = append(newTokens, t)
-			}
-			systemDB.PrivateTables["tokens"] = newTokens
-			tm.db.data["system"] = systemDB
-		}
-		tm.db.mu.Unlock()
-	}
-
-	// Replicate token consumption to all peer servers
-	if tm.replManager != nil {
-		tm.replManager.EnqueueTokenConsumeEvent(encryptedToken, record.UsedAt)
-	}
-
-	// Remove from in-memory cache
-	delete(tm.tokens, encryptedToken)
-
 	return nil
 }
 
@@ -508,11 +376,6 @@ func (tm *TokenManager) FlushTokens() {
 	defer tm.mu.Unlock()
 
 	tm.tokens = make(map[string]*TokenRecord)
-
-	// Clear from database
-	tm.db.mu.Lock()
-	tm.db.data["system"].PrivateTables["tokens"] = make([]interface{}, 0)
-	tm.db.mu.Unlock()
 }
 
 // encryptPayload encrypts a JWT payload using AES-256-GCM

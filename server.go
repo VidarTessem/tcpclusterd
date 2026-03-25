@@ -1515,16 +1515,7 @@ func authenticateTCPToken(token string) (string, bool, string, error) {
 		return "", false, "", fmt.Errorf("invalid token: %v", err)
 	}
 
-	if err := tokenManager.ConsumeToken(token); err != nil {
-		return "", false, "", fmt.Errorf("failed to consume token: %v", err)
-	}
-
-	nextToken, err := tokenManager.IssueToken(username, isAdmin)
-	if err != nil {
-		return "", false, "", fmt.Errorf("failed to issue next token: %v", err)
-	}
-
-	return username, isAdmin, nextToken, nil
+	return username, isAdmin, token, nil
 }
 
 func handleTCPSubscription(conn net.Conn, req SocketRequest) {
@@ -2790,7 +2781,7 @@ func startWebSocketService(cfg *modules.WebSocketConfig) net.Listener {
 
 		// TODO: Implement WebSocket service
 		// This will handle both mode 1 (onChange) and mode 2 (interval)
-		// with proper token rotation and keep-alive
+		// with stable token reuse and keep-alive
 
 		// For now, just accept connections
 		for {
