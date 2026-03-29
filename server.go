@@ -42,18 +42,25 @@ type Config struct {
 
 // Global variables
 var (
-	db             *modules.Database
-	replManager    *modules.ReplicationManager
-	tokenManager   *modules.TokenManager
-	httpServer     *modules.HTTPServer
-	clusterManager *modules.ClusterManager
-	peerServer     *modules.PeerServer
-	logger         *modules.Logger
-	config         *Config
-	socketListener net.Listener
+	db                      *modules.Database
+	replManager             *modules.ReplicationManager
+	tokenManager            *modules.TokenManager
+	httpServer              *modules.HTTPServer
+	clusterManager          *modules.ClusterManager
+	peerServer              *modules.PeerServer
+	logger                  *modules.Logger
+	config                  *Config
+	socketListener          net.Listener
+	serverStopChan          chan string
+	autoRecoveryEnabled     bool
+	autoRecoveryRuntimePath string
 )
 
-const socketPath = "/tmp/tcpclusterd.sock"
+const (
+	socketPath       = "/tmp/tcpclusterd.sock"
+	localSocketToken = "__local_socket__"
+	localSocketUser  = "admin"
+)
 
 var (
 	ErrSocketUnavailable         = errors.New("server socket unavailable")
@@ -187,6 +194,86 @@ func findPreviousRuntimePath() string {
 	return pairs[1].path
 }
 
+func listRuntimeSnapshots() []map[string]interface{} {
+	runtimeDir := "runtime"
+	entries, err := os.ReadDir(runtimeDir)
+	if err != nil {
+		return []map[string]interface{}{}
+	}
+
+	currentRuntimeAbs, _ := filepath.Abs(filepath.Clean(config.RuntimePath))
+	type runtimeEntry struct {
+		parsed time.Time
+		data   map[string]interface{}
+	}
+	runtimes := make([]runtimeEntry, 0, len(entries))
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+
+		name := strings.TrimSpace(entry.Name())
+		path := filepath.Join(runtimeDir, name)
+		absPath, _ := filepath.Abs(filepath.Clean(path))
+		info, statErr := entry.Info()
+		modifiedUnix := int64(0)
+		if statErr == nil {
+			modifiedUnix = info.ModTime().Unix()
+		}
+
+		parsed, parseErr := time.Parse("2006-01-02_15-04-05", name)
+		kind := "named"
+		timestampUnix := int64(0)
+		if parseErr == nil {
+			kind = "timestamped"
+			timestampUnix = parsed.Unix()
+		}
+
+		runtimes = append(runtimes, runtimeEntry{
+			parsed: parsed,
+			data: map[string]interface{}{
+				"name":            name,
+				"path":            path,
+				"kind":            kind,
+				"is_current":      absPath == currentRuntimeAbs,
+				"has_system":      fileExists(path + "/system.json"),
+				"has_runtime":     fileExists(path+"/runtime.json") || fileExists(path+"/runtime.json.gz"),
+				"has_database":    fileExists(path+"/runtime.json") || fileExists(path+"/runtime.json.gz") || fileExists(path+"/database.json"),
+				"has_wal":         fileExists(path + "/wal.jsonl"),
+				"has_serial_meta": fileExists(path + "/serial.meta.json"),
+				"modified_unix":   modifiedUnix,
+				"timestamp_unix":  timestampUnix,
+			},
+		})
+	}
+
+	sort.Slice(runtimes, func(i, j int) bool {
+		leftKind, _ := runtimes[i].data["kind"].(string)
+		rightKind, _ := runtimes[j].data["kind"].(string)
+		if leftKind != rightKind {
+			return leftKind == "timestamped"
+		}
+		if leftKind == "timestamped" {
+			return runtimes[i].parsed.After(runtimes[j].parsed)
+		}
+		leftName, _ := runtimes[i].data["name"].(string)
+		rightName, _ := runtimes[j].data["name"].(string)
+		return leftName < rightName
+	})
+
+	result := make([]map[string]interface{}, 0, len(runtimes))
+	for _, runtime := range runtimes {
+		result = append(result, runtime.data)
+	}
+	return result
+}
+
+func fileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
+}
+
 // importDatabaseFromJSON imports a database from JSON data via cluster replication
 func importDatabaseFromJSON(importData map[string]interface{}) error {
 	jsonBytes, err := json.Marshal(importData)
@@ -274,6 +361,11 @@ func main() {
 	password := flag.String("password", "", "Password for user (if not provided, a random one will be generated)")
 	clearRuntimes := flag.Bool("clearruntimes", false, "Clear old runtime folders")
 	export := flag.Bool("export", false, "Export database and exit (usage: --export [dbname])")
+	listTarget := flag.String("list", "", "List target: runtimes, users, services, cors, cluster")
+	loadTarget := flag.String("load", "", "Load target: runtime or cluster")
+	configService := flag.String("config", "", "Configure service: http, tcp, ws, cors")
+	invalidateUser := flag.String("invalidate", "", "Invalidate all tokens for a user")
+	auto := flag.Bool("auto", false, "Automatically choose startup data source")
 	importFile := flag.String("import", "", "Import database from file")
 	importClear := flag.Bool("clear", false, "Use with --import to clear current runtime data before import")
 	lastRuntime := flag.Bool("lastruntime", false, "Load database from last runtime folder and start server")
@@ -282,32 +374,91 @@ func main() {
 	importPersistent := flag.Bool("importpersistent", false, "Load database from persistent backup and start server")
 	listUsers := flag.Bool("listusers", false, "List all users and exit")
 	listServices := flag.Bool("list-services", false, "List service configurations and exit")
+	listCORS := flag.Bool("list-cors", false, "List API CORS configuration and exit")
 	listCluster := flag.Bool("list-cluster", false, "List cluster peers from CLUSTER_PEERS and exit")
+	listRuntimes := flag.Bool("listruntimes", false, "List runtime directories and exit")
 	peerMetrics := flag.Bool("peer-metrics", false, "Show peer metrics (usage: --peer-metrics [peer_address])")
 	removeUser := flag.String("remove", "", "Remove a user and delete their personal database (usage: --remove username)")
+	start := flag.Bool("start", false, "Start the server unless it is already running")
+	stop := flag.Bool("stop", false, "Stop the running server via socket")
 	flushTokens := flag.Bool("flushtokens", false, "Flush all authentication tokens and exit")
+	flushWAL := flag.Bool("flushwal", false, "Flush runtime WAL and force later peers to full-sync")
 	configHTTP := flag.String("config-http", "", "Configure HTTP service (usage: --config-http enabled=true port=9090 host=0.0.0.0 tls=false)")
 	configTCP := flag.String("config-tcp", "", "Configure TCP service (usage: --config-tcp enabled=true port=5000 host=0.0.0.0)")
 	configWS := flag.String("config-ws", "", "Configure WebSocket service (usage: --config-ws enabled=true port=8080 host=0.0.0.0). Client controls polling interval.")
+	configCORS := flag.String("config-cors", "", "Configure API CORS (usage: --config-cors allow_all_origins=false allowed_origins=https://app.example.com allow_credentials=true)")
 	addCluster := flag.String("add-cluster", "", "Deprecated: cluster peers are configured via CLUSTER_PEERS in .env")
 	removeCluster := flag.String("remove-cluster", "", "Deprecated: cluster peers are configured via CLUSTER_PEERS in .env")
 	flag.Parse()
+
+	loadRuntimeCmd := false
+	loadClusterCmd := false
+	configVerbUsed := false
+	if target := strings.ToLower(strings.TrimSpace(*listTarget)); target != "" {
+		switch target {
+		case "runtimes", "runtime":
+			*listRuntimes = true
+		case "users", "user":
+			*listUsers = true
+		case "services", "service":
+			*listServices = true
+		case "cors":
+			*listCORS = true
+		case "cluster", "peers":
+			*listCluster = true
+		default:
+			_ = writeJSONOutput(normalizeSocketResponse(SocketRequest{Command: "list"}, SocketResponse{Success: false, Code: "invalid_list_target", Message: fmt.Sprintf("unsupported list target: %s", target)}))
+			os.Exit(1)
+		}
+	}
+	if target := strings.ToLower(strings.TrimSpace(*loadTarget)); target != "" {
+		switch target {
+		case "runtime":
+			loadRuntimeCmd = true
+		case "cluster":
+			loadClusterCmd = true
+		default:
+			_ = writeJSONOutput(normalizeSocketResponse(SocketRequest{Command: "load"}, SocketResponse{Success: false, Code: "invalid_load_target", Message: fmt.Sprintf("unsupported load target: %s", target)}))
+			os.Exit(1)
+		}
+	}
 
 	// Support unquoted config flags, e.g.:
 	//   --config-tcp enabled=true port=8081 host=0.0.0.0
 	// Standard Go flag parsing only captures the first token after the flag value.
 	// If there are trailing key=value tokens and one config flag is active, append them.
-	if *configHTTP != "" && flag.NArg() > 0 {
+	if *configService != "" && flag.NArg() > 0 {
+		params := strings.TrimSpace(strings.Join(flag.Args(), " "))
+		configVerbUsed = true
+		switch strings.ToLower(strings.TrimSpace(*configService)) {
+		case "http", "api":
+			*configHTTP = params
+		case "tcp":
+			*configTCP = params
+		case "ws", "websocket":
+			*configWS = params
+		case "cors":
+			*configCORS = params
+		default:
+			_ = writeJSONOutput(normalizeSocketResponse(SocketRequest{Command: "config"}, SocketResponse{Success: false, Code: "invalid_config_target", Message: fmt.Sprintf("unsupported config target: %s", *configService)}))
+			os.Exit(1)
+		}
+	}
+	if *configHTTP != "" && flag.NArg() > 0 && !configVerbUsed {
 		parts := append([]string{*configHTTP}, flag.Args()...)
 		*configHTTP = strings.TrimSpace(strings.Join(parts, " "))
 	}
-	if *configTCP != "" && flag.NArg() > 0 {
+	if *configTCP != "" && flag.NArg() > 0 && !configVerbUsed {
 		parts := append([]string{*configTCP}, flag.Args()...)
 		*configTCP = strings.TrimSpace(strings.Join(parts, " "))
 	}
-	if *configWS != "" && flag.NArg() > 0 {
+	if *configWS != "" && flag.NArg() > 0 && !configVerbUsed {
 		parts := append([]string{*configWS}, flag.Args()...)
 		*configWS = strings.TrimSpace(strings.Join(parts, " "))
+	}
+	if *configCORS != "" && flag.NArg() > 0 && !configVerbUsed {
+		parts := append([]string{*configCORS}, flag.Args()...)
+		*configCORS = strings.TrimSpace(strings.Join(parts, " "))
 	}
 
 	// Get optional arguments for export and peer-metrics
@@ -322,10 +473,24 @@ func main() {
 	}
 
 	// Check if this is a CLI command (not starting server)
-	isCLICommand := *export || *exportLastRuntime || *importFile != "" || *lastRuntime || *loadLastRuntime || *importPersistent || *listUsers || *listServices || *listCluster || *addUser != "" || *removeUser != "" || *flushTokens || *configHTTP != "" || *configTCP != "" || *configWS != "" || *peerMetrics || *addCluster != "" || *removeCluster != ""
+	isCLICommand := *export || *exportLastRuntime || *importFile != "" || *lastRuntime || *loadLastRuntime || *importPersistent || *listUsers || *listServices || *listCORS || *listCluster || *listRuntimes || loadRuntimeCmd || loadClusterCmd || *invalidateUser != "" || *addUser != "" || *removeUser != "" || *stop || *flushTokens || *flushWAL || *configHTTP != "" || *configTCP != "" || *configWS != "" || *configCORS != "" || *peerMetrics || *addCluster != "" || *removeCluster != ""
+
+	if *start && isServerRunning() {
+		if err := writeJSONOutput(normalizeSocketResponse(SocketRequest{Command: "start"}, SocketResponse{
+			Success: true,
+			Message: "server already running",
+			Data: map[string]interface{}{
+				"socket_path": socketPath,
+			},
+		})); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to write json output: %v\n", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
 
 	// Print version only when starting server (no arguments)
-	if !isCLICommand {
+	if !isCLICommand && !*start {
 		fmt.Println("tcpclusterd version 1.0.4")
 	}
 
@@ -333,7 +498,7 @@ func main() {
 	// This MUST be done BEFORE initializing cluster manager
 	if isCLICommand {
 		// Try socket connection first
-		err := handleCLIViaSocket(*export, exportDbName, *exportLastRuntime, *importFile, *importClear, *lastRuntime, *loadLastRuntime, *importPersistent, *listUsers, *listServices, *listCluster, *addUser, *force, *removeUser, *flushTokens, *configHTTP, *configTCP, *configWS, *peerMetrics, peerMetricsAddr, *addCluster, *removeCluster, *password)
+		err := handleCLIViaSocket(*export, exportDbName, *exportLastRuntime, *importFile, *importClear, *lastRuntime, *loadLastRuntime, *importPersistent, *listUsers, *listServices, *listCORS, *listCluster, *listRuntimes, loadRuntimeCmd, loadClusterCmd, *invalidateUser, *addUser, *force, *removeUser, *stop, *flushTokens, *flushWAL, *configHTTP, *configTCP, *configWS, *configCORS, *peerMetrics, peerMetricsAddr, *addCluster, *removeCluster, *password)
 		if err == nil {
 			os.Exit(0)
 		}
@@ -345,6 +510,19 @@ func main() {
 		} else {
 			logger.Error("CLI command failed via running server: %v", err)
 			os.Exit(1)
+		}
+	}
+
+	bootstrapSystemPath := ""
+	if *auto {
+		bootstrapSystemPath = findLatestRuntimePath()
+		if bootstrapSystemPath != "" && strings.TrimSpace(config.ClusterPeers) == "" {
+			bootstrapDB := modules.NewDatabase(bootstrapSystemPath, config.PersistentBackupPath, config.AutoClearRuntimes, config.AutoBackupEnabled)
+			if err := bootstrapDB.LoadSystemSnapshotFromDir(bootstrapSystemPath); err == nil {
+				if peers := bootstrapDB.ReplicationPeers(); len(peers) > 0 {
+					config.ClusterPeers = strings.Join(peers, ",")
+				}
+			}
 		}
 	}
 
@@ -375,14 +553,30 @@ func main() {
 
 	// Initialize database with appropriate runtime path
 	db = modules.NewDatabase(runtimePath, config.PersistentBackupPath, config.AutoClearRuntimes, config.AutoBackupEnabled)
+	if clusterManager != nil {
+		remotePeers := clusterManager.GetRemotePeers()
+		addresses := make([]string, 0, len(remotePeers))
+		for _, peer := range remotePeers {
+			addresses = append(addresses, peer.Address)
+		}
+		db.SetReplicationPeers(addresses)
+	}
 
-	// Try to load existing runtime
-	dbErr := db.LoadRuntimeSnapshot()
-	if dbErr != nil {
-		log.Printf("Warning: Failed to load runtime: %v", dbErr)
-		// Initialize with default config if no runtime exists
-		if initErr := db.InitializeDatabase(config.AdminPassword); initErr != nil {
-			log.Fatalf("Failed to initialize database: %v", initErr)
+	if *auto {
+		if bootstrapSystemPath != "" {
+			if err := db.LoadSystemSnapshotFromDir(bootstrapSystemPath); err != nil {
+				log.Printf("Warning: Failed to load system snapshot for auto bootstrap: %v", err)
+			}
+		}
+	} else {
+		// Try to load existing runtime
+		dbErr := db.LoadRuntimeSnapshot()
+		if dbErr != nil {
+			log.Printf("Warning: Failed to load runtime: %v", dbErr)
+			// Initialize with default config if no runtime exists
+			if initErr := db.InitializeDatabase(config.AdminPassword); initErr != nil {
+				log.Fatalf("Failed to initialize database: %v", initErr)
+			}
 		}
 	}
 
@@ -403,6 +597,133 @@ func main() {
 	if *configWS != "" {
 		configureServiceCLI("websocket", *configWS)
 		os.Exit(0)
+	}
+
+	if *configCORS != "" {
+		configureCORSCLI(*configCORS)
+		os.Exit(0)
+	}
+
+	if *listCORS {
+		listCORSCLI()
+		os.Exit(0)
+	}
+
+	if *flushWAL {
+		if err := db.FlushRuntimeWAL(); err != nil {
+			logger.Error("Failed to flush WAL: %v", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+
+	if loadRuntimeCmd {
+		resp := normalizeSocketResponse(SocketRequest{Command: "loadruntime"}, SocketResponse{})
+		runtimePath, reason := selectRuntimeLoadCandidate()
+		if runtimePath == "" {
+			resp.Success = false
+			resp.OK = false
+			resp.Status = "error"
+			resp.Code = "no_runtime_candidate"
+			resp.Message = "No previous runtime candidate found"
+		} else if err := loadRuntimeFromPath(runtimePath); err != nil {
+			resp.Success = false
+			resp.OK = false
+			resp.Status = "error"
+			resp.Code = "error"
+			resp.Message = err.Error()
+		} else {
+			resp.Success = true
+			resp.OK = true
+			resp.Status = "ok"
+			resp.Code = "ok"
+			resp.Message = fmt.Sprintf("Runtime loaded from: %s", runtimePath)
+			resp.Data = map[string]interface{}{"runtime_path": runtimePath, "reason": reason}
+		}
+		_ = writeJSONOutput(resp)
+		if !resp.Success {
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+
+	if loadClusterCmd {
+		resp := normalizeSocketResponse(SocketRequest{Command: "loadcluster", Data: map[string]interface{}{"force": *force}}, SocketResponse{})
+		result, err := loadClusterFromPeers(*force)
+		if err != nil {
+			resp.Success = false
+			resp.OK = false
+			resp.Status = "error"
+			resp.Code = "cluster_load_failed"
+			resp.Message = err.Error()
+		} else {
+			resp.Success = true
+			resp.OK = true
+			resp.Status = "ok"
+			resp.Code = "ok"
+			resp.Message = "Cluster runtime loaded"
+			resp.Data = result
+		}
+		_ = writeJSONOutput(resp)
+		if !resp.Success {
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+
+	if *invalidateUser != "" {
+		invalidBefore := time.Now().Unix()
+		err := applyClusterWrite("invalidate_user_tokens", map[string]interface{}{"username": *invalidateUser, "tokens_invalid_before": invalidBefore})
+		resp := normalizeSocketResponse(SocketRequest{Command: "invalidate"}, SocketResponse{})
+		if err != nil {
+			resp.Success = false
+			resp.OK = false
+			resp.Status = "error"
+			resp.Code = "error"
+			resp.Message = err.Error()
+		} else {
+			cacheRemoved := 0
+			if tokenManager != nil {
+				cacheRemoved = tokenManager.InvalidateUserTokens(strings.TrimSpace(*invalidateUser))
+			}
+			resp.Success = true
+			resp.OK = true
+			resp.Status = "ok"
+			resp.Code = "ok"
+			resp.Message = fmt.Sprintf("Tokens invalidated for user '%s'", *invalidateUser)
+			resp.Data = map[string]interface{}{"username": *invalidateUser, "tokens_invalid_before": invalidBefore, "cache_tokens_removed": cacheRemoved}
+		}
+		_ = writeJSONOutput(resp)
+		if !resp.Success {
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+
+	if *auto {
+		decision, err := executeAutoDecision()
+		resp := normalizeSocketResponse(SocketRequest{Command: "auto"}, SocketResponse{})
+		if err != nil {
+			resp.Success = false
+			resp.OK = false
+			resp.Status = "error"
+			resp.Code = "auto_failed"
+			resp.Message = err.Error()
+			_ = writeJSONOutput(resp)
+			os.Exit(1)
+		}
+		resp.Success = true
+		resp.OK = true
+		resp.Status = "ok"
+		resp.Code = "ok"
+		if action, ok := decision["action"].(string); ok {
+			resp.Message = action
+		}
+		resp.Data = decision
+		if err := writeJSONOutput(resp); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to write json output: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	// Handle add cluster server
@@ -553,6 +874,8 @@ func removeUserCmd(username string) {
 }
 
 func startServer() {
+	serverStopChan = make(chan string, 1)
+
 	// Get local peer address if cluster is configured
 	var localPeer string
 	if clusterManager != nil {
@@ -600,7 +923,7 @@ func startServer() {
 
 	// Initialize HTTP server (before peer server, just handles local queries)
 	wsServer := modules.NewWebSocketServer(db, tokenManager, 30)
-	httpServer = modules.NewHTTPServer(db, replManager, tokenManager, wsServer, nil, nil, replToken)
+	httpServer = modules.NewHTTPServer(db, replManager, tokenManager, wsServer, peerServer, clusterManager, replToken)
 	httpServer.RegisterHandlers()
 
 	// Initialize service manager for dynamic service configuration
@@ -630,6 +953,9 @@ func startServer() {
 
 	// Start periodic service config watcher
 	go watchServiceConfig(serviceManager)
+	if autoRecoveryEnabled {
+		go runAutoRecovery(serviceManager)
+	}
 
 	// Start periodic retry worker for failed cluster writes
 	if clusterManager != nil && peerServer != nil {
@@ -645,8 +971,13 @@ func startServer() {
 	log.Println("Server started with socket-only mode. Services will be dynamically loaded from database.")
 
 	// Wait for shutdown signal
-	<-sigChan
-	log.Println("Shutting down...")
+	shutdownReason := "signal"
+	select {
+	case sig := <-sigChan:
+		shutdownReason = sig.String()
+	case shutdownReason = <-serverStopChan:
+	}
+	log.Printf("Shutting down (%s)...", shutdownReason)
 
 	// Final save before exit
 	if err := db.SaveRuntimeSnapshot(); err != nil {
@@ -764,9 +1095,58 @@ type SocketRequest struct {
 }
 
 type SocketResponse struct {
-	Success bool                   `json:"success"`
-	Message string                 `json:"message,omitempty"`
-	Data    map[string]interface{} `json:"data,omitempty"`
+	Success   bool                   `json:"success"`
+	OK        bool                   `json:"ok"`
+	Status    string                 `json:"status,omitempty"`
+	Code      string                 `json:"code,omitempty"`
+	Command   string                 `json:"command,omitempty"`
+	Message   string                 `json:"message,omitempty"`
+	Data      map[string]interface{} `json:"data,omitempty"`
+	Timestamp int64                  `json:"timestamp"`
+}
+
+func normalizeSocketResponse(req SocketRequest, resp SocketResponse) SocketResponse {
+	resp.OK = resp.Success
+	if resp.Status == "" {
+		if resp.Success {
+			resp.Status = "ok"
+		} else {
+			resp.Status = "error"
+		}
+	}
+	if resp.Code == "" {
+		if resp.Success {
+			resp.Code = "ok"
+		} else {
+			resp.Code = "error"
+		}
+	}
+	if resp.Command == "" {
+		resp.Command = req.Command
+	}
+	if resp.Timestamp == 0 {
+		resp.Timestamp = time.Now().Unix()
+	}
+	return resp
+}
+
+func writeJSONOutput(value interface{}) error {
+	encoder := json.NewEncoder(os.Stdout)
+	encoder.SetEscapeHTML(false)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(value)
+}
+
+func requestServerStop(reason string) error {
+	if serverStopChan == nil {
+		return fmt.Errorf("server stop channel is unavailable")
+	}
+	select {
+	case serverStopChan <- reason:
+		return nil
+	default:
+		return fmt.Errorf("shutdown already in progress")
+	}
 }
 
 // isServerRunning checks if server is already running by trying to connect to socket
@@ -780,85 +1160,38 @@ func isServerRunning() bool {
 }
 
 // handleCLIViaSocket handles all CLI commands by connecting to the running server socket
-func handleCLIViaSocket(export bool, exportDbName string, exportLastRuntime bool, importFile string, importClear bool, lastRuntime bool, loadLastRuntime bool, importPersistent bool, listUsers bool, listServices bool, listCluster bool, addUser string, force bool, removeUser string, flushTokens bool, configHTTP string, configTCP string, configWS string, peerMetrics bool, peerMetricsAddr string, addCluster string, removeCluster string, password string) error {
-	// Handle export
-	if export {
-		req := SocketRequest{
-			Command: "export",
-			Data:    map[string]interface{}{"dbname": exportDbName},
-		}
-		resp, err := sendSocketCommand(req)
-		if err != nil {
-			return err
-		}
-		if !resp.Success {
-			return fmt.Errorf("export failed: %s", resp.Message)
-		}
-		if jsonStr, ok := resp.Data["json"].(string); ok {
-			fmt.Println(jsonStr)
-		}
-		return nil
-	}
+func handleCLIViaSocket(export bool, exportDbName string, exportLastRuntime bool, importFile string, importClear bool, lastRuntime bool, loadLastRuntime bool, importPersistent bool, listUsers bool, listServices bool, listCORS bool, listCluster bool, listRuntimes bool, loadRuntime bool, loadCluster bool, invalidateUser string, addUser string, force bool, removeUser string, stop bool, flushTokens bool, flushWAL bool, configHTTP string, configTCP string, configWS string, configCORS string, peerMetrics bool, peerMetricsAddr string, addCluster string, removeCluster string, password string) error {
+	var (
+		req       *SocketRequest
+		resp      *SocketResponse
+		localResp *SocketResponse
+	)
 
-	// Handle list users
-	if listUsers {
-		req := SocketRequest{Command: "listusers"}
-		resp, err := sendSocketCommand(req)
-		if err != nil {
-			return err
-		}
-		if !resp.Success {
-			return fmt.Errorf("listusers failed: %s", resp.Message)
-		}
-		if users, ok := resp.Data["users"]; ok {
-			data, _ := json.MarshalIndent(users, "", "  ")
-			fmt.Println(string(data))
-		}
-		return nil
-	}
-
-	// Handle list services
-	if listServices {
-		req := SocketRequest{Command: "listservices"}
-		resp, err := sendSocketCommand(req)
-		if err != nil {
-			return err
-		}
-		if !resp.Success {
-			return fmt.Errorf("listservices failed: %s", resp.Message)
-		}
-		if services, ok := resp.Data["services"]; ok {
-			data, _ := json.MarshalIndent(services, "", "  ")
-			fmt.Println(string(data))
-		}
-		return nil
-	}
-
-	// Handle list cluster
-	if listCluster {
-		req := SocketRequest{Command: "listcluster"}
-		resp, err := sendSocketCommand(req)
-		if err != nil {
-			return err
-		}
-		if !resp.Success {
-			return fmt.Errorf("listcluster failed: %s", resp.Message)
-		}
-		if servers, ok := resp.Data["servers"]; ok {
-			data, _ := json.MarshalIndent(servers, "", "  ")
-			fmt.Println(string(data))
-		}
-		return nil
-	}
-
-	// Handle add user
-	if addUser != "" {
-		// Generate password if not provided
+	switch {
+	case export:
+		req = &SocketRequest{Command: "export", Data: map[string]interface{}{"dbname": exportDbName}}
+	case listUsers:
+		req = &SocketRequest{Command: "listusers"}
+	case listServices:
+		req = &SocketRequest{Command: "listservices"}
+	case listCORS:
+		req = &SocketRequest{Command: "listcors"}
+	case listCluster:
+		req = &SocketRequest{Command: "listcluster"}
+	case listRuntimes:
+		req = &SocketRequest{Command: "listruntimes"}
+	case loadRuntime:
+		req = &SocketRequest{Command: "loadruntime"}
+	case loadCluster:
+		req = &SocketRequest{Command: "loadcluster", Data: map[string]interface{}{"force": force}}
+	case invalidateUser != "":
+		req = &SocketRequest{Command: "invalidate", Data: map[string]interface{}{"username": invalidateUser}}
+	case addUser != "":
 		userPassword := password
 		if userPassword == "" {
 			userPassword = generateRandomPassword(16)
 		}
-		req := SocketRequest{
+		req = &SocketRequest{
 			Command: "adduser",
 			Data: map[string]interface{}{
 				"username": addUser,
@@ -866,226 +1199,79 @@ func handleCLIViaSocket(export bool, exportDbName string, exportLastRuntime bool
 				"password": userPassword,
 			},
 		}
-		resp, err := sendSocketCommand(req)
+		resp, err := sendSocketCommand(*req)
 		if err != nil {
 			return err
 		}
-		if !resp.Success {
-			return fmt.Errorf("adduser failed: %s", resp.Message)
-		}
-		fmt.Println(resp.Message)
 		if password == "" {
-			fmt.Printf("Generated password: %s\n", userPassword)
+			if resp.Data == nil {
+				resp.Data = map[string]interface{}{}
+			}
+			resp.Data["generated_password"] = userPassword
 		}
-		return nil
-	}
-
-	// Handle remove user
-	if removeUser != "" {
-		req := SocketRequest{
-			Command: "removeuser",
-			Data:    map[string]interface{}{"username": removeUser},
-		}
-		resp, err := sendSocketCommand(req)
-		if err != nil {
-			return err
-		}
-		if !resp.Success {
-			return fmt.Errorf("removeuser failed: %s", resp.Message)
-		}
-		fmt.Println(resp.Message)
-		return nil
-	}
-
-	// Handle flush tokens
-	if flushTokens {
-		req := SocketRequest{Command: "flushtokens"}
-		resp, err := sendSocketCommand(req)
-		if err != nil {
-			return err
-		}
-		if !resp.Success {
-			return fmt.Errorf("flushtokens failed: %s", resp.Message)
-		}
-		fmt.Println(resp.Message)
-		return nil
-	}
-
-	// Handle HTTP config
-	if configHTTP != "" {
-		req := SocketRequest{
-			Command: "configure",
-			Data: map[string]interface{}{
-				"service": "http",
-				"config":  configHTTP,
-			},
-		}
-		resp, err := sendSocketCommand(req)
-		if err != nil {
-			return err
-		}
-		if !resp.Success {
-			return fmt.Errorf("HTTP config failed: %s", resp.Message)
-		}
-		fmt.Println(resp.Message)
-		return nil
-	}
-
-	// Handle TCP config
-	if configTCP != "" {
-		req := SocketRequest{
-			Command: "configure",
-			Data: map[string]interface{}{
-				"service": "tcp",
-				"config":  configTCP,
-			},
-		}
-		resp, err := sendSocketCommand(req)
-		if err != nil {
-			return err
-		}
-		if !resp.Success {
-			return fmt.Errorf("TCP config failed: %s", resp.Message)
-		}
-		fmt.Println(resp.Message)
-		return nil
-	}
-
-	// Handle WebSocket config
-	if configWS != "" {
-		req := SocketRequest{
-			Command: "configure",
-			Data: map[string]interface{}{
-				"service": "ws",
-				"config":  configWS,
-			},
-		}
-		resp, err := sendSocketCommand(req)
-		if err != nil {
-			return err
-		}
-		if !resp.Success {
-			return fmt.Errorf("WebSocket config failed: %s", resp.Message)
-		}
-		fmt.Println(resp.Message)
-		return nil
-	}
-
-	// Handle peer metrics
-	if peerMetrics {
-		req := SocketRequest{
-			Command: "peermetrics",
-		}
+		localResp = resp
+	case removeUser != "":
+		req = &SocketRequest{Command: "removeuser", Data: map[string]interface{}{"username": removeUser}}
+	case stop:
+		req = &SocketRequest{Command: "stop"}
+	case flushTokens:
+		req = &SocketRequest{Command: "flushtokens"}
+	case flushWAL:
+		req = &SocketRequest{Command: "flushwal"}
+	case configHTTP != "":
+		req = &SocketRequest{Command: "configure", Data: map[string]interface{}{"service": "http", "config": configHTTP}}
+	case configTCP != "":
+		req = &SocketRequest{Command: "configure", Data: map[string]interface{}{"service": "tcp", "config": configTCP}}
+	case configWS != "":
+		req = &SocketRequest{Command: "configure", Data: map[string]interface{}{"service": "ws", "config": configWS}}
+	case configCORS != "":
+		req = &SocketRequest{Command: "configurecors", Data: map[string]interface{}{"config": configCORS}}
+	case peerMetrics:
+		req = &SocketRequest{Command: "peermetrics"}
 		if peerMetricsAddr != "" {
 			req.Data = map[string]interface{}{"peer_address": peerMetricsAddr}
 		}
-		resp, err := sendSocketCommand(req)
+	case exportLastRuntime:
+		req = &SocketRequest{Command: "exportlastruntime"}
+	case lastRuntime:
+		req = &SocketRequest{Command: "lastruntime"}
+	case loadLastRuntime:
+		req = &SocketRequest{Command: "loadlastruntime"}
+	case importFile != "":
+		data, readErr := os.ReadFile(importFile)
+		if readErr != nil {
+			return fmt.Errorf("failed to read import file: %v", readErr)
+		}
+		req = &SocketRequest{Command: "import", Data: map[string]interface{}{"json": string(data), "clear": importClear}}
+	case importPersistent:
+		req = &SocketRequest{Command: "importpersistent"}
+	case addCluster != "" || removeCluster != "":
+		req = &SocketRequest{Command: "cluster-config"}
+		localResp = &SocketResponse{Success: false, Message: "add-cluster and remove-cluster are deprecated. Edit CLUSTER_PEERS in .env on all nodes."}
+	default:
+		return fmt.Errorf("no valid CLI command")
+	}
+
+	if localResp == nil {
+		var err error
+		resp, err = sendSocketCommand(*req)
 		if err != nil {
 			return err
 		}
-		if !resp.Success {
-			return fmt.Errorf("peermetrics failed: %s", resp.Message)
-		}
-		if metric, ok := resp.Data["metric"]; ok {
-			data, _ := json.MarshalIndent(metric, "", "  ")
-			fmt.Println(string(data))
-		} else if metrics, ok := resp.Data["metrics"]; ok {
-			data, _ := json.MarshalIndent(metrics, "", "  ")
-			fmt.Println(string(data))
-		}
-		return nil
+		localResp = resp
+	}
+	if req != nil {
+		normalized := normalizeSocketResponse(*req, *localResp)
+		localResp = &normalized
 	}
 
-	// Handle exportlastruntime via socket (exports previous runtime database)
-	if exportLastRuntime {
-		req := SocketRequest{Command: "exportlastruntime"}
-		resp, err := sendSocketCommand(req)
-		if err != nil {
-			return err
-		}
-		if !resp.Success {
-			return fmt.Errorf("exportlastruntime failed: %s", resp.Message)
-		}
-		if data, ok := resp.Data["export"]; ok {
-			jsonData, _ := json.MarshalIndent(data, "", "  ")
-			fmt.Println(string(jsonData))
-		}
-		return nil
+	if err := writeJSONOutput(localResp); err != nil {
+		return fmt.Errorf("failed to write json output: %w", err)
 	}
-
-	// Handle lastruntime via socket
-	if lastRuntime {
-		req := SocketRequest{Command: "lastruntime"}
-		resp, err := sendSocketCommand(req)
-		if err != nil {
-			return err
-		}
-		if !resp.Success {
-			return fmt.Errorf("lastruntime failed: %s", resp.Message)
-		}
-		fmt.Println(resp.Message)
-		return nil
+	if !localResp.Success {
+		return fmt.Errorf("%s failed: %s", localResp.Command, localResp.Message)
 	}
-
-	// Handle loadlastruntime via socket (load previous runtime)
-	if loadLastRuntime {
-		req := SocketRequest{Command: "loadlastruntime"}
-		resp, err := sendSocketCommand(req)
-		if err != nil {
-			return err
-		}
-		if !resp.Success {
-			return fmt.Errorf("loadlastruntime failed: %s", resp.Message)
-		}
-		fmt.Println(resp.Message)
-		return nil
-	}
-
-	// Handle import via socket
-	if importFile != "" {
-		data, err := os.ReadFile(importFile)
-		if err != nil {
-			return fmt.Errorf("failed to read import file: %v", err)
-		}
-		req := SocketRequest{
-			Command: "import",
-			Data: map[string]interface{}{
-				"json":  string(data),
-				"clear": importClear,
-			},
-		}
-		resp, err := sendSocketCommand(req)
-		if err != nil {
-			return err
-		}
-		if !resp.Success {
-			return fmt.Errorf("import failed: %s", resp.Message)
-		}
-		fmt.Println(resp.Message)
-		return nil
-	}
-
-	// Handle importpersistent via socket
-	if importPersistent {
-		req := SocketRequest{Command: "importpersistent"}
-		resp, err := sendSocketCommand(req)
-		if err != nil {
-			return err
-		}
-		if !resp.Success {
-			return fmt.Errorf("importpersistent failed: %s", resp.Message)
-		}
-		fmt.Println(resp.Message)
-		return nil
-	}
-
-	// add-cluster and remove-cluster are deprecated
-	if addCluster != "" || removeCluster != "" {
-		fmt.Println("add-cluster and remove-cluster are deprecated. Edit CLUSTER_PEERS in .env on all nodes.")
-		return nil
-	}
-
-	return fmt.Errorf("no valid CLI command")
+	return nil
 }
 
 // sendSocketCommand sends a command to the running server via Unix socket
@@ -1143,29 +1329,13 @@ func startSocketServer() {
 	}()
 }
 
-// handleSocketConnection handles incoming socket connections for CLI commands
+// handleSocketConnection handles incoming local socket connections.
 func handleSocketConnection(conn net.Conn) {
-	defer conn.Close()
-
-	var req SocketRequest
-	decoder := json.NewDecoder(conn)
-	if err := decoder.Decode(&req); err != nil {
-		if err.Error() != "EOF" {
-			log.Printf("Failed to decode socket request: %v", err)
-		}
-		return
-	}
-
-	resp := executeSocketCommand(req)
-
-	encoder := json.NewEncoder(conn)
-	if err := encoder.Encode(resp); err != nil {
-		log.Printf("Failed to encode socket response: %v", err)
-	}
+	handleProtocolConnection(conn, true)
 }
 
 // executeSocketCommand executes commands received via socket
-func executeSocketCommand(req SocketRequest) SocketResponse {
+func executeSocketCommand(req SocketRequest, allowUnauthenticated bool) SocketResponse {
 	switch req.Command {
 	case "export":
 		dbname, _ := req.Data["dbname"].(string)
@@ -1200,11 +1370,28 @@ func executeSocketCommand(req SocketRequest) SocketResponse {
 			Data:    map[string]interface{}{"services": services},
 		}
 
+	case "listcors":
+		return SocketResponse{
+			Success: true,
+			Data:    map[string]interface{}{"cors": db.GetAPICORSConfig()},
+		}
+
 	case "listcluster":
 		servers := getClusterPeersView()
 		return SocketResponse{
 			Success: true,
 			Data:    map[string]interface{}{"servers": servers},
+		}
+
+	case "listruntimes":
+		runtimes := listRuntimeSnapshots()
+		return SocketResponse{
+			Success: true,
+			Message: "runtime directories listed",
+			Data: map[string]interface{}{
+				"runtimes": runtimes,
+				"count":    len(runtimes),
+			},
 		}
 
 	case "peermetrics":
@@ -1275,6 +1462,24 @@ func executeSocketCommand(req SocketRequest) SocketResponse {
 		}
 		return SocketResponse{Success: true, Message: "All tokens flushed"}
 
+	case "flushwal":
+		if err := db.FlushRuntimeWAL(); err != nil {
+			return SocketResponse{Success: false, Message: err.Error()}
+		}
+		return SocketResponse{Success: true, Message: "Runtime WAL flushed; later lagging peers must full-sync"}
+
+	case "stop":
+		if err := requestServerStop("socket stop command"); err != nil {
+			return SocketResponse{Success: false, Message: err.Error()}
+		}
+		return SocketResponse{
+			Success: true,
+			Message: "shutdown requested",
+			Data: map[string]interface{}{
+				"socket_path": socketPath,
+			},
+		}
+
 	case "configure":
 		service, _ := req.Data["service"].(string)
 		configStr, _ := req.Data["config"].(string)
@@ -1294,6 +1499,17 @@ func executeSocketCommand(req SocketRequest) SocketResponse {
 		}
 
 		return SocketResponse{Success: true, Message: fmt.Sprintf("Service '%s' configured successfully", service)}
+
+	case "configurecors":
+		configStr, _ := req.Data["config"].(string)
+		if strings.TrimSpace(configStr) == "" {
+			return SocketResponse{Success: false, Message: "config required"}
+		}
+		params := parseConfigParams(configStr)
+		if err := applyClusterWrite("configure_api_cors", params); err != nil {
+			return SocketResponse{Success: false, Message: err.Error()}
+		}
+		return SocketResponse{Success: true, Message: "API CORS configured successfully", Data: map[string]interface{}{"cors": db.GetAPICORSConfig()}}
 
 	case "import":
 		jsonStr, _ := req.Data["json"].(string)
@@ -1351,10 +1567,9 @@ func executeSocketCommand(req SocketRequest) SocketResponse {
 		if lastPath == "" {
 			return SocketResponse{Success: false, Message: "No previous runtime found"}
 		}
-		// Load and export from that runtime
-		data, err := os.ReadFile(lastPath + "/database.json")
+		data, err := exportRuntimeDirJSON(lastPath)
 		if err != nil {
-			return SocketResponse{Success: false, Message: fmt.Sprintf("failed to read runtime database: %v", err)}
+			return SocketResponse{Success: false, Message: fmt.Sprintf("failed to export runtime database: %v", err)}
 		}
 		var exportData interface{}
 		if err := json.Unmarshal(data, &exportData); err != nil {
@@ -1382,20 +1597,7 @@ func executeSocketCommand(req SocketRequest) SocketResponse {
 			return SocketResponse{Success: false, Message: "No previous runtime found"}
 		}
 
-		// Load database from that runtime
-		data, err := os.ReadFile(lastPath + "/database.json")
-		if err != nil {
-			return SocketResponse{Success: false, Message: fmt.Sprintf("failed to read runtime database: %v", err)}
-		}
-
-		// Parse and load into current database
-		var importData map[string]interface{}
-		if err := json.Unmarshal(data, &importData); err != nil {
-			return SocketResponse{Success: false, Message: fmt.Sprintf("failed to parse runtime database: %v", err)}
-		}
-
-		// Import the data into the running database
-		if err := importDatabaseFromJSON(importData); err != nil {
+		if err := loadRuntimeFromPath(lastPath); err != nil {
 			return SocketResponse{Success: false, Message: fmt.Sprintf("failed to import database: %v", err)}
 		}
 
@@ -1404,10 +1606,58 @@ func executeSocketCommand(req SocketRequest) SocketResponse {
 			Message: fmt.Sprintf("✓ Previous runtime database loaded from: %s", lastPath),
 		}
 
+	case "loadruntime":
+		runtimePath, reason := selectRuntimeLoadCandidate()
+		if runtimePath == "" {
+			return SocketResponse{Success: false, Code: "no_runtime_candidate", Message: "No previous runtime candidate found"}
+		}
+		if err := loadRuntimeFromPath(runtimePath); err != nil {
+			return SocketResponse{Success: false, Message: err.Error()}
+		}
+		return SocketResponse{
+			Success: true,
+			Message: fmt.Sprintf("Runtime loaded from: %s", runtimePath),
+			Data: map[string]interface{}{
+				"runtime_path": runtimePath,
+				"reason":       reason,
+			},
+		}
+
+	case "loadcluster":
+		force, _ := req.Data["force"].(bool)
+		result, err := loadClusterFromPeers(force)
+		if err != nil {
+			return SocketResponse{Success: false, Code: "cluster_load_failed", Message: err.Error()}
+		}
+		return SocketResponse{
+			Success: true,
+			Message: "Cluster runtime loaded",
+			Data:    result,
+		}
+
+	case "invalidate":
+		username, _ := req.Data["username"].(string)
+		invalidBefore := time.Now().Unix()
+		if err := applyClusterWrite("invalidate_user_tokens", map[string]interface{}{"username": username, "tokens_invalid_before": invalidBefore}); err != nil {
+			return SocketResponse{Success: false, Message: err.Error()}
+		}
+		cacheRemoved := 0
+		if tokenManager != nil {
+			cacheRemoved = tokenManager.InvalidateUserTokens(strings.TrimSpace(username))
+		}
+		return SocketResponse{
+			Success: true,
+			Message: fmt.Sprintf("Tokens invalidated for user '%s'", username),
+			Data: map[string]interface{}{
+				"username":              username,
+				"tokens_invalid_before": invalidBefore,
+				"cache_tokens_removed":  cacheRemoved,
+			},
+		}
+
 	case "adjust":
 		// Atomically adjust (add/subtract) a column value in a table row
 		// Data: { token, dbname, table, column, delta (int), where (map) }
-		token, _ := req.Data["token"].(string)
 		dbname, _ := req.Data["dbname"].(string)
 		tableName, _ := req.Data["table"].(string)
 		columnName, _ := req.Data["column"].(string)
@@ -1419,7 +1669,7 @@ func executeSocketCommand(req SocketRequest) SocketResponse {
 			return SocketResponse{Success: false, Message: "adjust requires: dbname, table, column, delta, where"}
 		}
 
-		username, _, nextToken, err := authenticateTCPToken(token)
+		username, _, nextToken, err := resolveCommandIdentity(req, allowUnauthenticated)
 		if err != nil {
 			return SocketResponse{Success: false, Message: err.Error()}
 		}
@@ -1518,15 +1768,25 @@ func authenticateTCPToken(token string) (string, bool, string, error) {
 	return username, isAdmin, token, nil
 }
 
-func handleTCPSubscription(conn net.Conn, req SocketRequest) {
+func resolveCommandIdentity(req SocketRequest, allowUnauthenticated bool) (string, bool, string, error) {
+	if allowUnauthenticated {
+		return localSocketUser, true, localSocketToken, nil
+	}
+	if req.Data == nil {
+		return "", false, "", fmt.Errorf("authentication required: call auth first, then include token")
+	}
+	token, _ := req.Data["token"].(string)
+	return authenticateTCPToken(token)
+}
+
+func handleTCPSubscription(conn net.Conn, req SocketRequest, allowUnauthenticated bool) {
 	if req.Data == nil {
 		req.Data = map[string]interface{}{}
 	}
 
-	token, _ := req.Data["token"].(string)
-	_, _, nextToken, err := authenticateTCPToken(token)
+	_, _, nextToken, err := resolveCommandIdentity(req, allowUnauthenticated)
 	if err != nil {
-		_ = json.NewEncoder(conn).Encode(SocketResponse{Success: false, Message: err.Error()})
+		_ = json.NewEncoder(conn).Encode(normalizeSocketResponse(req, SocketResponse{Success: false, Message: err.Error()}))
 		return
 	}
 
@@ -1553,11 +1813,11 @@ func handleTCPSubscription(conn net.Conn, req SocketRequest) {
 	sendSnapshot := func(message string) error {
 		payload, exportErr := exportDatabaseJSON(dbname, includeTokens)
 		if exportErr != nil {
-			return encoder.Encode(SocketResponse{Success: false, Message: fmt.Sprintf("failed to export database: %v", exportErr)})
+			return encoder.Encode(normalizeSocketResponse(req, SocketResponse{Success: false, Message: fmt.Sprintf("failed to export database: %v", exportErr)}))
 		}
 
 		_ = conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
-		return encoder.Encode(SocketResponse{
+		return encoder.Encode(normalizeSocketResponse(req, SocketResponse{
 			Success: true,
 			Message: message,
 			Data: map[string]interface{}{
@@ -1565,7 +1825,7 @@ func handleTCPSubscription(conn net.Conn, req SocketRequest) {
 				"token":            nextToken,
 				"interval_seconds": intervalSeconds,
 			},
-		})
+		}))
 	}
 
 	if err := sendSnapshot("subscription started"); err != nil {
@@ -1656,6 +1916,25 @@ func listServicesCLI() {
 	// No server running - start temporary one
 	runWithTempServer(func() error {
 		listAllServices()
+		return nil
+	})
+}
+
+func listCORSCLI() {
+	if isServerRunning() {
+		resp, err := sendSocketCommand(SocketRequest{Command: "listcors"})
+		if err != nil {
+			log.Fatalf("Failed to list API CORS configuration: %v", err)
+		}
+		if !resp.Success {
+			log.Fatalf("Error: %s", resp.Message)
+		}
+		fmt.Printf("API CORS: %+v\n", resp.Data["cors"])
+		return
+	}
+
+	runWithTempServer(func() error {
+		fmt.Printf("API CORS: %+v\n", db.GetAPICORSConfig())
 		return nil
 	})
 }
@@ -1973,6 +2252,29 @@ func configureServiceCLI(service, configStr string) {
 	})
 }
 
+func configureCORSCLI(configStr string) {
+	if isServerRunning() {
+		resp, err := sendSocketCommand(SocketRequest{
+			Command: "configurecors",
+			Data: map[string]interface{}{
+				"config": configStr,
+			},
+		})
+		if err != nil {
+			log.Fatalf("Failed to configure API CORS: %v", err)
+		}
+		if !resp.Success {
+			log.Fatalf("Error: %s", resp.Message)
+		}
+		fmt.Println(resp.Message)
+		return
+	}
+
+	runWithTempServer(func() error {
+		return configureCORS(configStr)
+	})
+}
+
 // configureService parses configuration string and updates the service config
 func configureService(service, configStr string) error {
 	params := parseConfigParams(configStr)
@@ -1998,6 +2300,17 @@ func configureService(service, configStr string) error {
 	}
 
 	fmt.Printf("✓ Service '%s' configured successfully\n", service)
+	fmt.Printf("  Configuration: %+v\n", params)
+	return nil
+}
+
+func configureCORS(configStr string) error {
+	params := parseConfigParams(configStr)
+	if err := applyClusterWrite("configure_api_cors", params); err != nil {
+		return fmt.Errorf("failed to configure API CORS: %w", err)
+	}
+
+	fmt.Printf("✓ API CORS configured successfully\n")
 	fmt.Printf("  Configuration: %+v\n", params)
 	return nil
 }
@@ -2108,14 +2421,12 @@ func performNetworkDiagnostics() string {
 // applyClusterWrite applies a write with strong consistency:
 // 1) replicate to all peers and wait for ACK, 2) apply locally, 3) persist snapshot.
 func applyClusterWrite(operation string, data map[string]interface{}) error {
-	writeID := fmt.Sprintf("%s-%d", operation, time.Now().UnixNano())
 	localPeer := "local"
 	if clusterManager != nil && clusterManager.GetLocalPeer() != nil {
 		localPeer = clusterManager.GetLocalPeer().Address
 	}
 
 	writeOp := &modules.WriteOperation{
-		ID:         writeID,
 		Operation:  operation,
 		Data:       data,
 		Timestamp:  time.Now().Unix(),
@@ -2128,8 +2439,13 @@ func applyClusterWrite(operation string, data map[string]interface{}) error {
 		return err
 	}
 
+	serial := db.CurrentLastAppliedSerial()
+	writeID := fmt.Sprintf("%s-%020d", operation, serial)
+	writeOp.Serial = serial
+	writeOp.ID = writeID
+
 	// Track for later replication before attempting immediate cluster commit.
-	db.LogWriteWithID(writeID, writeOp.Operation, writeOp.Database, writeOp.Table, writeOp.Data, writeOp.Where, writeOp.IsPrivate)
+	db.LogWriteWithIDAndSerial(writeID, serial, writeOp.Operation, writeOp.Database, writeOp.Table, writeOp.Data, writeOp.Where, writeOp.IsPrivate)
 
 	if clusterManager != nil {
 		clusterManager.TrackWrite(writeID, "system", "cluster_op", operation, data)
@@ -2175,35 +2491,108 @@ func executeReplicatedWrite(writeOp *modules.WriteOperation) error {
 			}
 			return fmt.Errorf("user already exists")
 		}
-		return db.AddUserWithForce(username, password, force)
+		if writeOp.Serial > 0 {
+			return db.AddUserWithForceDirectWithSerial(username, password, force, writeOp.Serial)
+		}
+		return db.AddUserWithForceDirect(username, password, force)
 
 	case "remove_user":
 		username, _ := writeOp.Data["username"].(string)
 		if username == "" || username == "admin" {
 			return fmt.Errorf("invalid username")
 		}
-		return db.RemoveUser(username)
+		if writeOp.Serial > 0 {
+			return db.RemoveUserDirectWithSerial(username, writeOp.Serial)
+		}
+		return db.RemoveUserDirect(username)
 
 	case "flush_tokens":
-		_, err := db.DeleteRows("system", "tokens", map[string]string{}, true)
+		var err error
+		if writeOp.Serial > 0 {
+			_, err = db.DeleteRowsDirectWithSerial("system", "tokens", map[string]string{}, true, writeOp.Serial)
+		} else {
+			_, err = db.DeleteRowsDirect("system", "tokens", map[string]string{}, true)
+		}
 		return err
+
+	case "invalidate_user_tokens":
+		username, _ := writeOp.Data["username"].(string)
+		if strings.TrimSpace(username) == "" {
+			return fmt.Errorf("invalidate_user_tokens requires username")
+		}
+		invalidBefore := time.Now().Unix()
+		switch value := writeOp.Data["tokens_invalid_before"].(type) {
+		case int64:
+			invalidBefore = value
+		case int:
+			invalidBefore = int64(value)
+		case float64:
+			invalidBefore = int64(value)
+		}
+		var (
+			updated int
+			err     error
+		)
+		if writeOp.Serial > 0 {
+			updated, err = db.UpdateRowsDirectWithSerial("system", "users", map[string]interface{}{"tokens_invalid_before": invalidBefore}, map[string]string{"username": username}, true, writeOp.Serial)
+		} else {
+			updated, err = db.UpdateRowsDirect("system", "users", map[string]interface{}{"tokens_invalid_before": invalidBefore}, map[string]string{"username": username}, true)
+		}
+		if err != nil {
+			return err
+		}
+		if updated == 0 {
+			return fmt.Errorf("user not found")
+		}
+		if tokenManager != nil {
+			tokenManager.InvalidateUserTokens(strings.TrimSpace(username))
+		}
+		return nil
+
+	case "system_log":
+		if writeOp.Serial > 0 {
+			return db.LogSystemEventDirectWithSerial(writeOp.Data, writeOp.Serial)
+		}
+		return db.LogSystemEventDirect(writeOp.Data)
 
 	case "insert":
 		// Use direct method to avoid recursive journal logging
+		if writeOp.Serial > 0 {
+			return db.InsertRowDirectWithSerial(writeOp.Database, writeOp.Table, writeOp.Data, writeOp.IsPrivate, writeOp.Serial)
+		}
 		return db.InsertRowDirect(writeOp.Database, writeOp.Table, writeOp.Data, writeOp.IsPrivate)
+
+	case "insert_log":
+		if writeOp.Serial > 0 {
+			return db.InsertLogRowDirectWithSerial(writeOp.Database, writeOp.Table, writeOp.Data, writeOp.Serial)
+		}
+		return db.InsertLogRowDirect(writeOp.Database, writeOp.Table, writeOp.Data)
 
 	case "delete":
 		// Use direct method to avoid recursive journal logging
-		_, err := db.DeleteRowsDirect(writeOp.Database, writeOp.Table, writeOp.Where, writeOp.IsPrivate)
+		var err error
+		if writeOp.Serial > 0 {
+			_, err = db.DeleteRowsDirectWithSerialAdvanced(writeOp.Database, writeOp.Table, writeOp.Where, writeOp.WhereConditions, writeOp.IsPrivate, writeOp.Serial)
+		} else {
+			_, err = db.DeleteRowsDirectAdvanced(writeOp.Database, writeOp.Table, writeOp.Where, writeOp.WhereConditions, writeOp.IsPrivate)
+		}
 		return err
 
 	case "update":
 		// Use direct method to avoid recursive journal logging
-		_, err := db.UpdateRowsDirect(writeOp.Database, writeOp.Table, writeOp.Data, writeOp.Where, writeOp.IsPrivate)
+		var err error
+		if writeOp.Serial > 0 {
+			_, err = db.UpdateRowsDirectWithSerialAdvanced(writeOp.Database, writeOp.Table, writeOp.Data, writeOp.Where, writeOp.WhereConditions, writeOp.IsPrivate, writeOp.Serial)
+		} else {
+			_, err = db.UpdateRowsDirectAdvanced(writeOp.Database, writeOp.Table, writeOp.Data, writeOp.Where, writeOp.WhereConditions, writeOp.IsPrivate)
+		}
 		return err
 
 	case "upsert":
 		// Use direct method to avoid recursive journal logging
+		if writeOp.Serial > 0 {
+			return db.UpsertRowDirectWithSerial(writeOp.Database, writeOp.Table, writeOp.Data, writeOp.IsPrivate, writeOp.Serial)
+		}
 		return db.UpsertRowDirect(writeOp.Database, writeOp.Table, writeOp.Data, writeOp.IsPrivate)
 
 	case "import":
@@ -2237,10 +2626,31 @@ func executeReplicatedWrite(writeOp *modules.WriteOperation) error {
 		}
 
 		// Use direct method to avoid recursive journal logging
+		if writeOp.Serial > 0 {
+			if err := db.ConfigureServiceDirectWithSerial(writeOp.Data, writeOp.Serial); err != nil {
+				return fmt.Errorf("failed to configure service: %w", err)
+			}
+			fmt.Printf("[CLUSTER] Service '%s' configured\n", service)
+			return nil
+		}
 		if err := db.ConfigureServiceDirect(writeOp.Data); err != nil {
 			return fmt.Errorf("failed to configure service: %w", err)
 		}
 		fmt.Printf("[CLUSTER] Service '%s' configured\n", service)
+		return nil
+
+	case "configure_api_cors":
+		if writeOp.Serial > 0 {
+			if err := db.ConfigureAPICORSDirectWithSerial(writeOp.Data, writeOp.Serial); err != nil {
+				return fmt.Errorf("failed to configure API CORS: %w", err)
+			}
+			fmt.Printf("[CLUSTER] API CORS configured\n")
+			return nil
+		}
+		if err := db.ConfigureAPICORSDirect(writeOp.Data); err != nil {
+			return fmt.Errorf("failed to configure API CORS: %w", err)
+		}
+		fmt.Printf("[CLUSTER] API CORS configured\n")
 		return nil
 
 	default:
@@ -2495,8 +2905,12 @@ func startTCPService(cfg *modules.ServiceConfig) net.Listener {
 
 // handleTCPConnection handles incoming TCP connections
 func handleTCPConnection(conn net.Conn) {
+	handleProtocolConnection(conn, false)
+}
+
+func handleProtocolConnection(conn net.Conn, allowUnauthenticated bool) {
 	defer conn.Close()
-	if parseEnvBool(os.Getenv("TCP_LOG_CONNECTIONS"), false) {
+	if !allowUnauthenticated && parseEnvBool(os.Getenv("TCP_LOG_CONNECTIONS"), false) {
 		log.Printf("TCP connection from %s", conn.RemoteAddr())
 	}
 
@@ -2524,7 +2938,7 @@ func handleTCPConnection(conn net.Conn) {
 					return
 				}
 				_ = conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
-				_ = encoder.Encode(SocketResponse{Success: false, Message: fmt.Sprintf("failed to read request: %v", err)})
+				_ = encoder.Encode(normalizeSocketResponse(SocketRequest{Command: "read"}, SocketResponse{Success: false, Message: fmt.Sprintf("failed to read request: %v", err)}))
 				return
 			}
 		}
@@ -2541,7 +2955,7 @@ func handleTCPConnection(conn net.Conn) {
 		if strings.HasPrefix(input, "{") {
 			if unmarshalErr := json.Unmarshal([]byte(input), &req); unmarshalErr != nil {
 				_ = conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
-				_ = encoder.Encode(SocketResponse{Success: false, Message: fmt.Sprintf("invalid json request: %v", unmarshalErr)})
+				_ = encoder.Encode(normalizeSocketResponse(SocketRequest{Command: "parse"}, SocketResponse{Success: false, Message: fmt.Sprintf("invalid json request: %v", unmarshalErr)}))
 				if errors.Is(err, io.EOF) {
 					return
 				}
@@ -2551,7 +2965,7 @@ func handleTCPConnection(conn net.Conn) {
 			cmdReq, parseErr := parseTCPTextCommand(input)
 			if parseErr != nil {
 				_ = conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
-				_ = encoder.Encode(SocketResponse{Success: false, Message: parseErr.Error()})
+				_ = encoder.Encode(normalizeSocketResponse(SocketRequest{Command: "parse"}, SocketResponse{Success: false, Message: parseErr.Error()}))
 				if errors.Is(err, io.EOF) {
 					return
 				}
@@ -2561,14 +2975,19 @@ func handleTCPConnection(conn net.Conn) {
 		}
 
 		if req.Command == "subscribe" {
-			handleTCPSubscription(conn, req)
+			handleTCPSubscription(conn, req, allowUnauthenticated)
 			return
 		}
 
-		resp := executeTCPCommand(req)
+		resp := executeTCPCommand(req, allowUnauthenticated)
+		resp = normalizeSocketResponse(req, resp)
 		_ = conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 		if encodeErr := encoder.Encode(resp); encodeErr != nil {
-			log.Printf("Failed to write TCP response: %v", encodeErr)
+			if allowUnauthenticated {
+				log.Printf("Failed to write socket response: %v", encodeErr)
+			} else {
+				log.Printf("Failed to write TCP response: %v", encodeErr)
+			}
 			return
 		}
 
@@ -2578,13 +2997,27 @@ func handleTCPConnection(conn net.Conn) {
 	}
 }
 
-func executeTCPCommand(req SocketRequest) SocketResponse {
+func executeTCPCommand(req SocketRequest, allowUnauthenticated bool) SocketResponse {
 	if req.Data == nil {
 		req.Data = map[string]interface{}{}
 	}
 
 	// Step 1: username/password authentication to get JWT token
 	if req.Command == "auth" {
+		if allowUnauthenticated {
+			return SocketResponse{
+				Success: true,
+				Message: "local socket access does not require authentication",
+				Data: map[string]interface{}{
+					"token":                   localSocketToken,
+					"username":                localSocketUser,
+					"is_admin":                true,
+					"transport":               "unix",
+					"authentication_required": false,
+				},
+			}
+		}
+
 		username, _ := req.Data["username"].(string)
 		password, _ := req.Data["password"].(string)
 		if username == "" || password == "" {
@@ -2609,8 +3042,7 @@ func executeTCPCommand(req SocketRequest) SocketResponse {
 	}
 
 	// Step 2: token-based access for all TCP commands
-	token, _ := req.Data["token"].(string)
-	username, _, nextToken, err := authenticateTCPToken(token)
+	username, _, nextToken, err := resolveCommandIdentity(req, allowUnauthenticated)
 	if err != nil {
 		return SocketResponse{Success: false, Message: err.Error()}
 	}
@@ -2645,7 +3077,11 @@ func executeTCPCommand(req SocketRequest) SocketResponse {
 		}
 
 		// Execute SQL command
-		result, err := parser.Execute(cmd, username)
+		requestSource := "socket:" + username
+		if allowUnauthenticated {
+			requestSource = "socket:local"
+		}
+		result, err := parser.ExecuteWithSource(cmd, username, requestSource)
 		if err != nil {
 			return SocketResponse{
 				Success: false,
@@ -2661,7 +3097,7 @@ func executeTCPCommand(req SocketRequest) SocketResponse {
 		}
 	}
 
-	resp := executeSocketCommand(req)
+	resp := executeSocketCommand(req, allowUnauthenticated)
 
 	if resp.Data == nil {
 		resp.Data = map[string]interface{}{}
@@ -2751,8 +3187,15 @@ func parseTCPTextCommand(input string) (SocketRequest, error) {
 		return SocketRequest{Command: "listusers"}, nil
 	case "listservices":
 		return SocketRequest{Command: "listservices"}, nil
+	case "listcors":
+		return SocketRequest{Command: "listcors"}, nil
 	case "listcluster":
 		return SocketRequest{Command: "listcluster"}, nil
+	case "configurecors":
+		if len(parts) < 2 {
+			return SocketRequest{}, fmt.Errorf("usage: configurecors <key=value ...>")
+		}
+		return SocketRequest{Command: "configurecors", Data: map[string]interface{}{"config": strings.Join(parts[1:], " ")}}, nil
 	case "peermetrics":
 		if len(parts) > 1 {
 			return SocketRequest{Command: "peermetrics", Data: map[string]interface{}{"peer_address": parts[1]}}, nil
@@ -2806,12 +3249,7 @@ func loadLastRuntimeCLI() error {
 
 	logger.Info("Loading database from last runtime: %s", latestPath)
 
-	data, err := os.ReadFile(filepath.Join(latestPath, "database.json"))
-	if err != nil {
-		return fmt.Errorf("failed to read last runtime database: %w", err)
-	}
-
-	if err := db.ImportFromJSON(data); err != nil {
+	if err := loadRuntimeFromPath(latestPath); err != nil {
 		return fmt.Errorf("failed to import last runtime database: %w", err)
 	}
 
@@ -2879,4 +3317,178 @@ func findLatestPersistentBackup(backupDir string) (string, error) {
 	}
 
 	return latestPath, nil
+}
+
+func exportRuntimeDirJSON(path string) ([]byte, error) {
+	trimmedPath := strings.TrimSpace(path)
+	if trimmedPath == "" {
+		return nil, fmt.Errorf("runtime path is required")
+	}
+	tempDB := modules.NewDatabase(trimmedPath, "", false, false)
+	if err := tempDB.LoadRuntimeSnapshot(); err != nil {
+		return nil, err
+	}
+	return tempDB.ExportToJSON()
+}
+
+func loadRuntimeFromPath(path string) error {
+	trimmedPath := strings.TrimSpace(path)
+	if trimmedPath == "" {
+		return fmt.Errorf("runtime path is required")
+	}
+
+	if err := db.LoadRuntimeDataSnapshotFromDir(trimmedPath); err != nil {
+		return fmt.Errorf("failed to import runtime database: %w", err)
+	}
+	if err := db.SaveRuntimeSnapshot(); err != nil {
+		return fmt.Errorf("failed to save runtime snapshot: %w", err)
+	}
+	return nil
+}
+
+func selectRuntimeLoadCandidate() (string, string) {
+	path := findPreviousRuntimePath()
+	if path == "" {
+		return "", "no_previous_runtime"
+	}
+	return path, "latest_non_current_runtime"
+}
+
+func loadClusterFromPeers(force bool) (map[string]interface{}, error) {
+	if db == nil {
+		return nil, fmt.Errorf("database not initialized")
+	}
+	if clusterManager == nil || peerServer == nil {
+		return nil, fmt.Errorf("cluster peer sync is unavailable")
+	}
+	if len(db.ReplicationPeers()) == 0 {
+		return nil, fmt.Errorf("no cluster peers configured")
+	}
+	if !force && !db.IsRuntimeDataEmpty() {
+		return nil, fmt.Errorf("local runtime already has data; rerun with force to replace it from cluster")
+	}
+
+	beforeSerial, _, _ := db.RuntimeSerialState()
+	beforeUpdatedAt := db.DatabaseUpdatedAt("")
+	beforeEmpty := db.IsRuntimeDataEmpty()
+
+	peerAddr, err := peerServer.RequestClusterSync(force, 3*time.Second)
+	if err != nil {
+		return nil, err
+	}
+
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		currentSerial, _, _ := db.RuntimeSerialState()
+		currentUpdatedAt := db.DatabaseUpdatedAt("")
+		if beforeEmpty {
+			if !db.IsRuntimeDataEmpty() || currentSerial > beforeSerial || currentUpdatedAt > beforeUpdatedAt {
+				return map[string]interface{}{
+					"peer":          peerAddr,
+					"force":         force,
+					"serial_before": beforeSerial,
+					"serial_after":  currentSerial,
+				}, nil
+			}
+		} else if force {
+			if currentSerial != beforeSerial || currentUpdatedAt != beforeUpdatedAt {
+				return map[string]interface{}{
+					"peer":          peerAddr,
+					"force":         force,
+					"serial_before": beforeSerial,
+					"serial_after":  currentSerial,
+				}, nil
+			}
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+
+	return nil, fmt.Errorf("cluster sync was requested from %s but no runtime data was applied before timeout", peerAddr)
+}
+
+func executeAutoDecision() (map[string]interface{}, error) {
+	decision := map[string]interface{}{
+		"action":  "start_blank_runtime",
+		"reason":  "empty_runtime_no_recovery_candidate",
+		"details": map[string]interface{}{},
+	}
+
+	if db != nil && !db.IsRuntimeDataEmpty() {
+		decision["action"] = "start_current_runtime"
+		decision["reason"] = "current_runtime_has_state"
+		decision["details"] = map[string]interface{}{
+			"runtime_path": config.RuntimePath,
+		}
+		return decision, nil
+	}
+
+	if clusterManager != nil && len(db.ReplicationPeers()) > 0 {
+		autoRecoveryEnabled = true
+		runtimePath, _ := selectRuntimeLoadCandidate()
+		autoRecoveryRuntimePath = runtimePath
+		decision["action"] = "wait_for_cluster_sync"
+		decision["reason"] = "system_snapshot_loaded_cluster_peers_available"
+		decision["details"] = map[string]interface{}{
+			"cluster_peers":         db.ReplicationPeers(),
+			"runtime_fallback_path": runtimePath,
+		}
+		return decision, nil
+	}
+
+	if runtimePath, reason := selectRuntimeLoadCandidate(); runtimePath != "" {
+		if err := loadRuntimeFromPath(runtimePath); err != nil {
+			return nil, err
+		}
+		decision["action"] = "load_runtime"
+		decision["reason"] = reason
+		decision["details"] = map[string]interface{}{
+			"runtime_path": runtimePath,
+		}
+		return decision, nil
+	}
+
+	if backupPath, err := findLatestPersistentBackup(config.PersistentBackupPath); err == nil {
+		if err := loadPersistentBackupCLI(); err != nil {
+			return nil, err
+		}
+		decision["action"] = "load_persistent_backup"
+		decision["reason"] = "no_runtime_candidate"
+		decision["details"] = map[string]interface{}{
+			"backup_path": backupPath,
+		}
+		return decision, nil
+	}
+
+	decision["details"] = map[string]interface{}{
+		"runtime_path": config.RuntimePath,
+	}
+	return decision, nil
+}
+
+func runAutoRecovery(serviceManager *modules.ServiceManager) {
+	if db == nil || !db.IsRuntimeDataEmpty() {
+		return
+	}
+
+	deadline := time.Now().Add(45 * time.Second)
+	for time.Now().Before(deadline) {
+		if !db.IsRuntimeDataEmpty() {
+			logger.Info("Auto recovery completed from cluster sync before local runtime fallback")
+			return
+		}
+		time.Sleep(2 * time.Second)
+	}
+
+	if db.IsRuntimeDataEmpty() && strings.TrimSpace(autoRecoveryRuntimePath) != "" {
+		logger.Warn("Cluster did not provide runtime data in time; loading local runtime fallback from %s", autoRecoveryRuntimePath)
+		if err := loadRuntimeFromPath(autoRecoveryRuntimePath); err != nil {
+			logger.Error("Auto runtime fallback failed: %v", err)
+			return
+		}
+		if serviceManager != nil {
+			if err := serviceManager.LoadConfigFromDatabase(); err != nil {
+				logger.Warn("Failed to reload service config after auto runtime fallback: %v", err)
+			}
+		}
+	}
 }
